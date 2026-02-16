@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 
 import discord
 from discord.ext import commands
 
+from .codex_bridge import run_codex
 from .config import Settings, load_settings
 
 
@@ -46,6 +48,31 @@ def build_bot(settings: Settings) -> commands.Bot:
     @bot.command(name="ping")
     async def ping(ctx: commands.Context[commands.Bot]) -> None:
         await ctx.reply("pong", mention_author=False)
+
+    @bot.command(name="codex")
+    async def codex(ctx: commands.Context[commands.Bot], *, prompt: str | None = None) -> None:
+        normalized_prompt = (prompt or "").strip()
+        if not normalized_prompt:
+            await ctx.reply("Uso: `!codex <texto>`", mention_author=False)
+            return
+
+        await ctx.trigger_typing()
+
+        try:
+            result = await asyncio.to_thread(
+                run_codex,
+                normalized_prompt,
+                settings.codex_cmd,
+                settings.codex_timeout_seconds,
+                settings.codex_workdir,
+            )
+        except Exception as exc:
+            logger.exception("Error while executing Codex command")
+            await ctx.reply(f"Erro ao executar Codex: {exc}", mention_author=False)
+            return
+
+        response_text = result.text.strip() or "(sem resposta do Codex)"
+        await ctx.reply(response_text, mention_author=False)
 
     return bot
 

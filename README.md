@@ -2,31 +2,36 @@
 
 Bot Discord local que funciona como ponte para interagir com o Codex rodando no seu PC.
 
-## Objetivo desta etapa
+## Objetivo
 
-Primeiro incremento (testável):
-- projeto versionado e organizado;
-- comando `!ping` funcionando;
-- filtro por usuário e canal permitidos via `.env`.
+Projeto incremental para:
+- receber comandos no Discord;
+- validar usuario/canal autorizados;
+- encaminhar `!codex <texto>` para o Codex local via CLI;
+- responder no mesmo canal.
 
 ## Estrutura
 
 ```text
 .
-├─ src/
-│  ├─ bot.py
-│  └─ config.py
-├─ scripts/
-│  └─ run.ps1
-├─ .env.example
-├─ .gitignore
-└─ requirements.txt
+|-- src/
+|   |-- bot.py
+|   |-- codex_bridge.py
+|   `-- config.py
+|-- scripts/
+|   `-- run.ps1
+|-- .env.example
+|-- .gitignore
+|-- README.md
+`-- requirements.txt
 ```
 
-## Pré-requisitos
+## Pre requisitos
 
 - Python 3.10+
-- Bot criado no Discord Developer Portal com `MESSAGE CONTENT INTENT` habilitado.
+- Bot criado no Discord Developer Portal
+- `MESSAGE CONTENT INTENT` habilitado para o bot
+- Codex CLI instalado no PC
 
 ## Setup
 
@@ -37,10 +42,13 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Edite o `.env` com:
-- `DISCORD_BOT_TOKEN`
-- `DISCORD_ALLOWED_USER_ID`
-- `DISCORD_ALLOWED_CHANNEL_ID` (opcional, mas recomendado)
+Edite o `.env`:
+- `DISCORD_BOT_TOKEN`: token do bot
+- `DISCORD_ALLOWED_USER_ID`: seu user id do Discord
+- `DISCORD_ALLOWED_CHANNEL_ID`: canal permitido (recomendado)
+- `CODEX_CMD`: comando para chamar Codex (padrao: `codex exec --skip-git-repo-check --json`)
+- `CODEX_TIMEOUT_SECONDS`: timeout da chamada do Codex
+- `CODEX_WORKDIR`: diretorio onde o Codex sera executado (vazio usa o diretorio atual)
 
 ## Rodar
 
@@ -54,20 +62,7 @@ ou:
 .\scripts\run.ps1
 ```
 
-## Teste rápido
+## Comandos
 
-No canal permitido:
-
-```text
-!ping
-```
-
-Resposta esperada:
-
-```text
-pong
-```
-
-## Próximo incremento
-
-Adicionar o comando `!codex <texto>` para encaminhar prompt ao Codex local e retornar a resposta no Discord.
+- `!ping` -> responde `pong`
+- `!codex <texto>` -> envia o texto para o Codex local e devolve a resposta
