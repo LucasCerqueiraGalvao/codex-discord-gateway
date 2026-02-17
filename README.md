@@ -4,43 +4,53 @@ Bot Discord local que funciona como ponte para o Codex rodando no seu PC.
 
 ## O que ele faz hoje
 
-- Escuta comandos apenas no canal configurado.
-- Aceita comandos apenas do seu `DISCORD_ALLOWED_USER_ID`.
+- Escuta mensagens no canal configurado.
+- Aceita mensagens apenas do seu `DISCORD_ALLOWED_USER_ID`.
+- Qualquer mensagem normal no canal vira prompt para o Codex.
 - Comandos disponiveis:
   - `!ping`
-  - `!codex <texto>`
-- Executa o Codex local via CLI (`subprocess`), sem abrir porta e sem ngrok.
-- Divide respostas longas em blocos para respeitar limite do Discord.
+  - `!codex <texto>` (opcional)
+  - `!help`
+  - `!baixo`, `!medio`, `!alto`, `!altissimo` (trocam o nivel de raciocinio)
+  - `!status` (mostra configuracao atual)
+  - `!timeout <segundos>` (altera timeout e salva no `.env`)
+  - `!reiniciar` (reinicia o processo do bot)
+  - `!comandos` (lista de exemplos prontos)
+- Processa anexos da mensagem (ex: `txt`, `py`, `pdf`, `csv`, imagens):
+  - imagens sao enviadas via `--image` para o Codex
+  - arquivos sao baixados localmente e repassados por caminho
+- Roda em segundo plano via tray app (icone na bandeja do Windows).
 - Salva logs locais:
-  - `logs/bot.log` (log tecnico)
-  - `logs/history.jsonl` (historico de requests/responses)
+  - `logs/bot.log` (bot)
+  - `logs/history.jsonl` (historico)
+  - `logs/tray.log` (launcher de bandeja)
 
 ## Estrutura
 
 ```text
 .
+|-- assets/
+|   `-- codex-gateway-icon-final.png
 |-- src/
+|   |-- attachments.py
 |   |-- bot.py
 |   |-- codex_bridge.py
 |   |-- config.py
 |   |-- history_log.py
-|   `-- text_utils.py
+|   |-- text_utils.py
+|   `-- tray_app.py
 |-- scripts/
+|   |-- install-startup-task.ps1
+|   |-- remove-startup-task.ps1
+|   |-- run-tray.ps1
 |   |-- run.ps1
-|   `-- setup.ps1
+|   |-- setup.ps1
+|   `-- stop-tray.ps1
 |-- .env.example
 |-- .gitignore
 |-- README.md
 `-- requirements.txt
 ```
-
-## Pre requisitos
-
-- Windows + PowerShell
-- Python 3.10+
-- Bot criado no Discord Developer Portal
-- `MESSAGE CONTENT INTENT` habilitado no bot
-- Codex CLI instalado na maquina
 
 ## Setup
 
@@ -51,49 +61,58 @@ cd C:\Users\lucas\Documents\Projects\personal\codex-discord-gateway
 
 Depois, edite `.env`.
 
-## Variaveis do .env
+## Variaveis importantes do .env
 
-Use `.env.example` como base.
+- `DISCORD_BOT_TOKEN`
+- `DISCORD_ALLOWED_USER_ID`
+- `DISCORD_ALLOWED_CHANNEL_ID`
+- `CODEX_CMD`
+- `CODEX_TIMEOUT_SECONDS`
+- `CODEX_WORKDIR`
+- `ATTACHMENTS_TEMP_DIR` (pasta temporaria dos anexos)
+- `ATTACHMENTS_MAX_MB` (limite por anexo)
+- `ATTACHMENTS_KEEP_FILES` (`true/false`, manter ou limpar anexos apos resposta)
 
-- `DISCORD_BOT_TOKEN`: token do bot
-- `DISCORD_ALLOWED_USER_ID`: seu user id
-- `DISCORD_ALLOWED_CHANNEL_ID`: canal permitido
-- `CODEX_CMD`: opcional; comando exato do Codex (se vazio, tenta fallback automatico)
-- `CODEX_TIMEOUT_SECONDS`: timeout da chamada do Codex
-- `CODEX_WORKDIR`: diretorio de execucao do Codex (vazio = diretorio atual)
-- `DISCORD_CHUNK_SIZE`: tamanho maximo por mensagem (100 a 2000, recomendado 1900)
-- `LOG_LEVEL`: nivel de log (`INFO`, `DEBUG`, etc)
-- `LOG_DIR`: pasta dos logs
+Recomendacao de `CODEX_CMD`:
 
-## Como o comando do Codex e detectado
-
-Se `CODEX_CMD` estiver vazio, o bot tenta nesta ordem:
-
-1. `codex exec --skip-git-repo-check --json`
-2. `codex exec --json`
-3. `codex exec --skip-git-repo-check`
-4. `codex exec`
-
-No primeiro que funcionar, ele reutiliza esse comando nas proximas chamadas.
-
-## Rodar
-
-```powershell
-.\scripts\run.ps1
+```text
+codex exec --skip-git-repo-check --json --sandbox danger-full-access -c model_reasoning_effort="medium"
 ```
 
-## Teste incremental
+## Rodar em segundo plano (bandeja)
 
-1. Teste conectividade:
-   - envie `!ping`
-   - esperado: `pong`
-2. Teste ponte com Codex:
-   - envie `!codex responda apenas com OK`
-   - esperado: resposta com `OK`
+Iniciar agora:
 
-## Seguranca
+```powershell
+.\scripts\run-tray.ps1
+```
 
-- Nao abre portas locais e nao expoe endpoint publico.
-- Ignora comandos de qualquer usuario diferente do configurado.
-- Pode restringir tambem por canal com `DISCORD_ALLOWED_CHANNEL_ID`.
-- `.env` esta no `.gitignore`.
+Parar tray + bot:
+
+```powershell
+.\scripts\stop-tray.ps1
+```
+
+## Iniciar automaticamente com o Windows
+
+Instalar tarefa de logon (abre o tray app):
+
+```powershell
+.\scripts\install-startup-task.ps1
+```
+
+Remover a tarefa:
+
+```powershell
+.\scripts\remove-startup-task.ps1
+```
+
+## Teste rapido
+
+1. Envie `!ping`.
+2. Envie mensagem normal sem comando, por exemplo `responda apenas com OK`.
+3. Envie `!help` para listar comandos.
+4. Troque nivel com `!medio` (ou `!baixo`, `!alto`, `!altissimo`).
+5. Veja status com `!status`.
+6. Ajuste timeout com `!timeout 300`.
+7. Teste anexos: envie uma imagem ou arquivo junto da mensagem.

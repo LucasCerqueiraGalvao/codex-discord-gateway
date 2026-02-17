@@ -4,4 +4,5 @@ __pycache__/
 .env
 .env.local
 logs/
+runtime/
 .pytest_cache/

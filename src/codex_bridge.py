@@ -67,27 +67,18 @@ def _has_output_file_arg(args: list[str]) -> bool:
 
 
 def _build_candidate_specs(command_override: str | None) -> list[CodexCommandSpec]:
-    candidates: list[CodexCommandSpec] = []
-    seen: set[tuple[str, ...]] = set()
-
     if command_override:
         override_args = _split_command(command_override)
         if not override_args:
             raise RuntimeError("CODEX_CMD is empty after parsing.")
-        override_spec = CodexCommandSpec(
-            args=override_args,
-            mode=_parse_mode_from_args(override_args),
-        )
-        candidates.append(override_spec)
-        seen.add(override_spec.args)
+        return [
+            CodexCommandSpec(
+                args=override_args,
+                mode=_parse_mode_from_args(override_args),
+            )
+        ]
 
-    for spec in DEFAULT_COMMAND_SPECS:
-        if spec.args in seen:
-            continue
-        candidates.append(spec)
-        seen.add(spec.args)
-
-    return candidates
+    return list(DEFAULT_COMMAND_SPECS)
 
 
 def _run_with_spec(
@@ -95,6 +86,7 @@ def _run_with_spec(
     prompt: str,
     timeout_seconds: int,
     workdir: str | None = None,
+    image_paths: list[str] | None = None,
 ) -> CodexResult:
     cmd = list(spec.args)
     output_file_path: Path | None = None
@@ -105,7 +97,11 @@ def _run_with_spec(
             output_file_path = Path(handle.name)
         cmd.extend(["-o", str(output_file_path)])
 
-    cmd.append(prompt)
+    if image_paths:
+        for image_path in image_paths:
+            cmd.extend(["--image", image_path])
+
+    cmd.extend(["--", prompt])
 
     try:
         process = subprocess.run(
@@ -167,7 +163,7 @@ class CodexBridge:
         self._candidates = _build_candidate_specs(command_override)
         self._active_spec: CodexCommandSpec | None = None
 
-    def run(self, prompt: str) -> CodexResult:
+    def run(self, prompt: str, image_paths: list[str] | None = None) -> CodexResult:
         errors: list[str] = []
         candidates: list[CodexCommandSpec] = []
 
@@ -185,6 +181,7 @@ class CodexBridge:
                     prompt=prompt,
                     timeout_seconds=self._timeout_seconds,
                     workdir=self._workdir,
+                    image_paths=image_paths,
                 )
             except Exception as exc:
                 errors.append(str(exc))
