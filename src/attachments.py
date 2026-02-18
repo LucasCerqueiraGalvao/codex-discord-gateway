@@ -19,6 +19,19 @@ IMAGE_EXTENSIONS = {
     ".tiff",
 }
 
+AUDIO_EXTENSIONS = {
+    ".aac",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".mp4",
+    ".oga",
+    ".ogg",
+    ".wav",
+    ".webm",
+    ".wma",
+}
+
 SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -29,6 +42,7 @@ class DownloadedAttachment:
     size_bytes: int
     content_type: str
     is_image: bool
+    is_audio: bool
 
 
 @dataclass(frozen=True)
@@ -50,6 +64,13 @@ def _is_image_attachment(attachment: discord.Attachment) -> bool:
     if content_type.startswith("image/"):
         return True
     return Path(attachment.filename).suffix.lower() in IMAGE_EXTENSIONS
+
+
+def _is_audio_attachment(attachment: discord.Attachment) -> bool:
+    content_type = (attachment.content_type or "").lower()
+    if content_type.startswith("audio/"):
+        return True
+    return Path(attachment.filename).suffix.lower() in AUDIO_EXTENSIONS
 
 
 async def download_attachments(
@@ -83,6 +104,7 @@ async def download_attachments(
                 size_bytes=size,
                 content_type=attachment.content_type or "",
                 is_image=_is_image_attachment(attachment),
+                is_audio=_is_audio_attachment(attachment),
             )
         )
 

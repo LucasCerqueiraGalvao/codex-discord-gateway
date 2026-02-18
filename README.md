@@ -8,6 +8,7 @@ Bot Discord local que funciona como ponte para o Codex rodando no seu PC.
 - Aceita mensagens apenas do seu `DISCORD_ALLOWED_USER_ID`.
 - Qualquer mensagem normal no canal vira prompt para o Codex.
 - Mantem contexto curto por canal para continuidade de conversa.
+- Aceita audio/voice message como prompt (transcricao local e privada).
 - Comandos disponiveis:
   - `!ping`
   - `!codex <texto>` (opcional)
@@ -21,6 +22,10 @@ Bot Discord local que funciona como ponte para o Codex rodando no seu PC.
 - Processa anexos da mensagem (ex: `txt`, `py`, `pdf`, `csv`, imagens):
   - imagens sao enviadas via `--image` para o Codex
   - arquivos sao baixados localmente e repassados por caminho
+- Processa anexos de audio (`ogg`, `mp3`, `wav`, `m4a`, `webm` etc.):
+  - transcreve localmente com `faster-whisper`
+  - publica a transcricao no canal
+  - envia a transcricao para o pipeline normal de prompt -> Codex
 - Roda em segundo plano via tray app (icone na bandeja do Windows).
 - Salva logs locais:
   - `logs/bot.log` (bot)
@@ -35,6 +40,7 @@ Bot Discord local que funciona como ponte para o Codex rodando no seu PC.
 |   `-- codex-gateway-icon-final.png
 |-- src/
 |   |-- attachments.py
+|   |-- audio_transcriber.py
 |   |-- bot.py
 |   |-- codex_bridge.py
 |   |-- config.py
@@ -74,6 +80,14 @@ Depois, edite `.env`.
 - `ATTACHMENTS_TEMP_DIR` (pasta temporaria dos anexos)
 - `ATTACHMENTS_MAX_MB` (limite por anexo)
 - `ATTACHMENTS_KEEP_FILES` (`true/false`, manter ou limpar anexos apos resposta)
+- `AUDIO_TRANSCRIPTION_ENABLED` (`true/false`, habilita STT local)
+- `AUDIO_STT_MODEL` (ex.: `small`, `medium`; default `small`)
+- `AUDIO_STT_LANGUAGE` (default `pt`; vazio = autodetect)
+- `AUDIO_STT_DEVICE` (default `cpu`)
+- `AUDIO_STT_COMPUTE_TYPE` (default `int8`)
+- `AUDIO_MAX_DURATION_SECONDS` (limite por audio; default `60`)
+- `AUDIO_RATE_LIMIT_PER_MINUTE` (limite de transcricoes por minuto; default `4`)
+- `AUDIO_MAX_FILES_PER_MESSAGE` (maximo de audios por mensagem; default `3`)
 - `TOKEN_BUDGET_TOTAL` (opcional, total de tokens para calcular restante/% no `!status`)
 - `MESSAGE_BUDGET_TOTAL` (opcional, total de mensagens para calcular restante/% no `!status`)
 - `CONTEXT_WINDOW_TOKENS` (opcional, tamanho da janela de contexto em tokens para mostrar % de uso)
@@ -88,6 +102,18 @@ Recomendacao de `CODEX_CMD`:
 ```text
 codex exec --skip-git-repo-check --json --sandbox danger-full-access -c model_reasoning_effort="medium"
 ```
+
+## Audio (voice message)
+
+- O bot baixa o anexo de audio no `runtime/attachments/<request_id>/`.
+- Faz transcricao local com `faster-whisper` (sem abrir porta publica).
+- Responde no canal com `Transcricao de audio: ...`.
+- Em seguida envia essa transcricao para o mesmo fluxo atual do Codex.
+- Se o audio passar do limite de duracao/tamanho, responde erro claro no canal.
+- Se houver muitas transcricoes seguidas, aplica rate limit e pede para aguardar.
+
+Observacao:
+- Na primeira transcricao, o modelo pode ser baixado automaticamente e demorar mais.
 
 ## Rodar em segundo plano (bandeja)
 
@@ -126,4 +152,5 @@ Remover a tarefa:
 5. Veja status com `!status`.
 6. Ajuste timeout com `!timeout 300`.
 7. Teste anexos: envie uma imagem ou arquivo junto da mensagem.
-8. Limpe o contexto atual com `!reset`.
+8. Teste voice message: envie um audio curto no canal.
+9. Limpe o contexto atual com `!reset`.

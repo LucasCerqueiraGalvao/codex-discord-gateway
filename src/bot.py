@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict, deque
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import discord
 from discord.ext import commands
 
 from .attachments import cleanup_attachments, download_attachments
+from .audio_transcriber import AudioTooLongError, AudioTranscriptionError, LocalAudioTranscriber
 from .codex_bridge import CodexBridge, CodexUsage
 from .config import Settings, load_settings
 from .codex_official_status import (
@@ -31,6 +33,7 @@ REASONING_PATTERN = re.compile(r'model_reasoning_effort\s*=\s*(?:"[^"]*"|\'[^\']
 MAX_CONTEXT_TURNS = 8
 MAX_CONTEXT_ENTRY_CHARS = 1600
 CHARS_PER_TOKEN_ESTIMATE = 4
+AUDIO_RATE_WINDOW_SECONDS = 60
 
 REASONING_BY_COMMAND: dict[str, str] = {
     "baixo": "low",
@@ -303,12 +306,24 @@ def build_bot(settings: Settings) -> commands.Bot:
     history_path = Path(settings.log_dir) / "history.jsonl"
     usage_stats = _load_usage_stats_from_history(history_path)
     history = HistoryLogger(history_path)
+    audio_transcriber = (
+        LocalAudioTranscriber(
+            model_name=settings.audio_stt_model,
+            language=settings.audio_stt_language,
+            device=settings.audio_stt_device,
+            compute_type=settings.audio_stt_compute_type,
+            logger=logger,
+        )
+        if settings.audio_transcription_enabled
+        else None
+    )
     state = {
         "codex_cmd": runtime_cmd,
         "codex_timeout_seconds": settings.codex_timeout_seconds,
         "codex_bridge": codex_bridge,
         "context_by_channel": {},
         "usage_stats": usage_stats,
+        "audio_rate_window": defaultdict(deque),
     }
 
     def _rebuild_bridge() -> None:
@@ -321,6 +336,24 @@ def build_bot(settings: Settings) -> commands.Bot:
 
     def _context_key(channel_id: int) -> str:
         return str(channel_id)
+
+    def _reserve_audio_rate_slot(user_id: int, slots: int = 1) -> tuple[bool, float]:
+        # Sliding window limiter: X transcriptions per 60s.
+        now_ts = datetime.now(timezone.utc).timestamp()
+        bucket: deque[float] = state["audio_rate_window"][user_id]
+        while bucket and now_ts - bucket[0] > AUDIO_RATE_WINDOW_SECONDS:
+            bucket.popleft()
+        needed_slots = max(slots, 1)
+        if len(bucket) + needed_slots > settings.audio_rate_limit_per_minute:
+            retry_after = (
+                max(AUDIO_RATE_WINDOW_SECONDS - (now_ts - bucket[0]), 0.0)
+                if bucket
+                else float(AUDIO_RATE_WINDOW_SECONDS)
+            )
+            return False, retry_after
+        for _ in range(needed_slots):
+            bucket.append(now_ts)
+        return True, 0.0
 
     def _context_turns_count(channel_id: int) -> int:
         key = _context_key(channel_id)
@@ -404,15 +437,13 @@ def build_bot(settings: Settings) -> commands.Bot:
         prompt: str,
         source: str,
     ) -> None:
-        normalized_prompt = (prompt or "").strip()
+        original_prompt = (prompt or "").strip()
+        normalized_prompt = original_prompt
         attachments_in_message = list(message.attachments)
-
-        if not normalized_prompt and attachments_in_message:
-            normalized_prompt = "Analise os anexos desta mensagem e responda de forma objetiva."
 
         if not normalized_prompt and not attachments_in_message:
             await message.reply(
-                "Uso: `!codex <texto>` ou envie mensagem normal no canal.",
+                "Envie texto, audio ou anexos para eu processar.",
                 mention_author=False,
             )
             return
@@ -426,7 +457,7 @@ def build_bot(settings: Settings) -> commands.Bot:
                 "source": source,
                 "user_id": message.author.id,
                 "channel_id": message.channel.id,
-                "prompt": normalized_prompt,
+                "prompt": original_prompt,
                 "attachment_count": len(attachments_in_message),
                 "attachment_names": attachment_names,
             }
@@ -443,7 +474,10 @@ def build_bot(settings: Settings) -> commands.Bot:
 
         collection = None
         downloaded_count = 0
+        audio_attachment_count = 0
+        transcribed_audio_count = 0
         skipped_attachments: list[str] = []
+        audio_errors: list[str] = []
         codex_prompt = normalized_prompt
         image_paths: list[str] = []
         user_context_text = normalized_prompt
@@ -460,12 +494,116 @@ def build_bot(settings: Settings) -> commands.Bot:
                 downloaded_count = len(collection.downloaded)
                 skipped_attachments = list(collection.skipped)
                 image_paths = [str(item.saved_path) for item in collection.downloaded if item.is_image]
+                audio_downloaded = [item for item in collection.downloaded if item.is_audio]
+                audio_attachment_count = len(audio_downloaded)
+
+                if audio_downloaded:
+                    if audio_transcriber is None:
+                        audio_errors.append("transcricao de audio desativada neste bot")
+                    else:
+                        max_audio_files = settings.audio_max_files_per_message
+                        allowed_audio_items = audio_downloaded[:max_audio_files]
+                        ignored_audio_items = audio_downloaded[max_audio_files:]
+                        for item in ignored_audio_items:
+                            audio_errors.append(
+                                f"{item.original_name} (ignorado: limite de {max_audio_files} audios por mensagem)"
+                            )
+
+                        allowed_audio, retry_after = _reserve_audio_rate_slot(
+                            message.author.id,
+                            slots=len(allowed_audio_items),
+                        )
+                        if not allowed_audio:
+                            retry_after_seconds = max(int(retry_after) + 1, 1)
+                            wait_message = (
+                                "Muitas transcricoes em sequencia. "
+                                f"Tente novamente em cerca de {retry_after_seconds}s."
+                            )
+                            history.write(
+                                {
+                                    "event": "audio_rate_limited",
+                                    "request_id": request_id,
+                                    "source": source,
+                                    "user_id": message.author.id,
+                                    "channel_id": message.channel.id,
+                                    "retry_after_seconds": retry_after_seconds,
+                                }
+                            )
+                            await message.reply(wait_message, mention_author=False)
+                            return
+
+                        transcribed_items: list[tuple[str, str, float | None, str | None]] = []
+                        for audio_item in allowed_audio_items:
+                            try:
+                                transcription = await asyncio.to_thread(
+                                    audio_transcriber.transcribe,
+                                    audio_item.saved_path,
+                                    max_duration_seconds=settings.audio_max_duration_seconds,
+                                )
+                            except AudioTooLongError as exc:
+                                audio_errors.append(
+                                    f"{audio_item.original_name} (ignorado: {exc.duration_seconds:.1f}s > {exc.max_duration_seconds}s)"
+                                )
+                                continue
+                            except AudioTranscriptionError as exc:
+                                audio_errors.append(f"{audio_item.original_name} (erro: {exc})")
+                                continue
+                            except Exception as exc:
+                                audio_errors.append(f"{audio_item.original_name} (erro inesperado: {exc})")
+                                continue
+
+                            transcribed_items.append(
+                                (
+                                    audio_item.original_name,
+                                    transcription.text,
+                                    transcription.duration_seconds,
+                                    transcription.detected_language,
+                                )
+                            )
+
+                        transcribed_audio_count = len(transcribed_items)
+                        if transcribed_items:
+                            transcription_lines = ["Transcricao de audio:"]
+                            prompt_transcription_lines = ["Transcricao de audio enviada pelo usuario:"]
+                            for idx, (name, text, duration, detected_language) in enumerate(transcribed_items, start=1):
+                                duration_text = (
+                                    f"{duration:.1f}s"
+                                    if isinstance(duration, (int, float)) and duration > 0
+                                    else "duracao desconhecida"
+                                )
+                                language_text = detected_language or settings.audio_stt_language or "auto"
+                                transcription_lines.append(
+                                    f"{idx}) {name} [{duration_text}, idioma={language_text}]"
+                                )
+                                transcription_lines.append(text)
+                                prompt_transcription_lines.append(f"[Audio {idx}: {name}]")
+                                prompt_transcription_lines.append(text)
+
+                            transcription_message = "\n".join(transcription_lines)
+                            transcription_chunks = split_for_discord(
+                                transcription_message,
+                                settings.discord_chunk_size,
+                            )
+                            await message.reply(transcription_chunks[0], mention_author=False)
+                            for extra_chunk in transcription_chunks[1:]:
+                                await message.channel.send(extra_chunk)
+
+                            prompt_audio_block = "\n".join(prompt_transcription_lines)
+                            if normalized_prompt:
+                                normalized_prompt = normalized_prompt + "\n\n" + prompt_audio_block
+                            else:
+                                normalized_prompt = prompt_audio_block
 
                 if collection.downloaded or collection.skipped:
                     attachment_lines = ["Arquivos anexados salvos localmente:"]
                     sent_names: list[str] = []
                     for item in collection.downloaded:
-                        kind = "imagem" if item.is_image else "arquivo"
+                        if item.is_image:
+                            kind = "imagem"
+                        elif item.is_audio:
+                            kind = "audio"
+                        else:
+                            kind = "arquivo"
                         sent_names.append(item.original_name)
                         attachment_lines.append(
                             f"- {item.original_name} -> {item.saved_path} ({kind}, {item.size_bytes} bytes)"
@@ -473,11 +611,49 @@ def build_bot(settings: Settings) -> commands.Bot:
                     for skipped in collection.skipped:
                         attachment_lines.append(f"- {skipped}")
                     if sent_names:
-                        user_context_text = user_context_text + "\n[Anexos: " + ", ".join(sent_names) + "]"
+                        user_context_text = (normalized_prompt or "").strip()
+                        if user_context_text:
+                            user_context_text += "\n"
+                        user_context_text += "[Anexos: " + ", ".join(sent_names) + "]"
                     attachment_lines.append("Use os caminhos acima para abrir/analisar os arquivos locais.")
                     if image_paths:
                         attachment_lines.append("As imagens tambem foram enviadas como input visual.")
-                    codex_prompt = normalized_prompt + "\n\n" + "\n".join(attachment_lines)
+                    if normalized_prompt:
+                        codex_prompt = normalized_prompt + "\n\n" + "\n".join(attachment_lines)
+                    else:
+                        codex_prompt = "\n".join(attachment_lines)
+
+                if audio_errors:
+                    warning_text = "Avisos de audio:\n- " + "\n- ".join(audio_errors)
+                    warning_chunks = split_for_discord(warning_text, settings.discord_chunk_size)
+                    await message.channel.send(warning_chunks[0])
+                    for extra_chunk in warning_chunks[1:]:
+                        await message.channel.send(extra_chunk)
+
+                if not normalized_prompt and attachments_in_message:
+                    normalized_prompt = "Analise os anexos desta mensagem e responda de forma objetiva."
+                    if codex_prompt:
+                        codex_prompt = normalized_prompt + "\n\n" + codex_prompt
+                    else:
+                        codex_prompt = normalized_prompt
+
+                if audio_attachment_count > 0 and transcribed_audio_count == 0 and not original_prompt:
+                    only_audio_in_message = all(item.is_audio for item in collection.downloaded) if collection.downloaded else True
+                    if only_audio_in_message:
+                        await message.reply(
+                            "Nao consegui transcrever o audio enviado. Verifique formato/duracao e tente novamente.",
+                            mention_author=False,
+                        )
+                        history.write(
+                            {
+                                "event": "audio_transcription_failed",
+                                "request_id": request_id,
+                                "source": source,
+                                "audio_attachment_count": audio_attachment_count,
+                                "audio_errors": audio_errors,
+                            }
+                        )
+                        return
 
             async with message.channel.typing():
                 active_bridge: CodexBridge = state["codex_bridge"]
@@ -493,6 +669,9 @@ def build_bot(settings: Settings) -> commands.Bot:
                     "error": str(exc),
                     "downloaded_attachments": downloaded_count,
                     "skipped_attachments": skipped_attachments,
+                    "audio_attachment_count": audio_attachment_count,
+                    "transcribed_audio_count": transcribed_audio_count,
+                    "audio_errors": audio_errors,
                 }
             )
             await message.reply(f"Erro ao executar Codex: {exc}", mention_author=False)
@@ -511,6 +690,8 @@ def build_bot(settings: Settings) -> commands.Bot:
             downloaded_count,
             len(skipped_attachments),
         )
+        if not user_context_text:
+            user_context_text = normalized_prompt
         _append_context(message.channel.id, user_context_text, result.text)
 
         usage_payload: dict[str, int] | None = None
@@ -534,6 +715,9 @@ def build_bot(settings: Settings) -> commands.Bot:
                 "chunk_count": len(chunks),
                 "downloaded_attachments": downloaded_count,
                 "skipped_attachments": skipped_attachments,
+                "audio_attachment_count": audio_attachment_count,
+                "transcribed_audio_count": transcribed_audio_count,
+                "audio_errors": audio_errors,
                 "context_turns_after": _context_turns_count(message.channel.id),
                 "usage_tokens": usage_payload,
             }
@@ -700,6 +884,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             "- `!comandos` -> exemplos prontos\n"
             "- `!help` -> mostra esta mensagem\n\n"
             "Voce tambem pode mandar mensagem normal sem `!codex`.\n"
+            "Voice message/arquivo de audio tambem vira prompt via transcricao local.\n"
             "Anexos (txt, py, pdf, imagens etc.) sao baixados e enviados para analise.\n"
             f"Nivel atual: `{current_effort}`"
         )
