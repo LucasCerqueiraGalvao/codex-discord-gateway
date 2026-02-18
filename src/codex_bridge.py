@@ -26,6 +26,22 @@ class CodexResult:
     stderr: str
     return_code: int
     command: str
+    usage: "CodexUsage | None" = None
+
+
+@dataclass(frozen=True)
+class CodexUsage:
+    input_tokens: int
+    cached_input_tokens: int
+    output_tokens: int
+
+    @property
+    def billable_input_tokens(self) -> int:
+        return max(self.input_tokens - self.cached_input_tokens, 0)
+
+    @property
+    def estimated_billable_tokens(self) -> int:
+        return self.billable_input_tokens + self.output_tokens
 
 
 DEFAULT_COMMAND_SPECS: tuple[CodexCommandSpec, ...] = (
@@ -56,6 +72,38 @@ def _extract_text_from_json_lines(lines: Iterable[str]) -> str:
         if item.get("type") == "agent_message":
             last_message = str(item.get("text", "")).strip()
     return last_message
+
+
+def _coerce_int(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_usage_from_json_lines(lines: Iterable[str]) -> CodexUsage | None:
+    last_usage: CodexUsage | None = None
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("type") != "turn.completed":
+            continue
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            continue
+
+        last_usage = CodexUsage(
+            input_tokens=_coerce_int(usage.get("input_tokens")),
+            cached_input_tokens=_coerce_int(usage.get("cached_input_tokens")),
+            output_tokens=_coerce_int(usage.get("output_tokens")),
+        )
+
+    return last_usage
 
 
 def _parse_mode_from_args(args: tuple[str, ...]) -> CommandMode:
@@ -127,8 +175,11 @@ def _run_with_spec(
             error_text = stderr or stdout or f"Command failed with return code {process.returncode}"
             raise RuntimeError(f"[{command_str}] {error_text}")
 
+        usage: CodexUsage | None = None
         if spec.mode == "json":
-            text = _extract_text_from_json_lines(stdout.splitlines()).strip()
+            lines = stdout.splitlines()
+            text = _extract_text_from_json_lines(lines).strip()
+            usage = _extract_usage_from_json_lines(lines)
         else:
             text = ""
             if output_file_path and output_file_path.exists():
@@ -143,6 +194,7 @@ def _run_with_spec(
             stderr=stderr,
             return_code=process.returncode,
             command=command_str,
+            usage=usage,
         )
     finally:
         if output_file_path and output_file_path.exists():

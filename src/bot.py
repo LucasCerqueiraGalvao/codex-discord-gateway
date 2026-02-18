@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from uuid import uuid4
@@ -13,14 +15,22 @@ import discord
 from discord.ext import commands
 
 from .attachments import cleanup_attachments, download_attachments
-from .codex_bridge import CodexBridge
+from .codex_bridge import CodexBridge, CodexUsage
 from .config import Settings, load_settings
+from .codex_official_status import (
+    read_latest_token_count_snapshot,
+    read_local_total_tokens_last_days,
+    read_official_rate_limits,
+)
 from .history_log import HistoryLogger
 from .text_utils import split_for_discord
 
 
 logger = logging.getLogger("discord_codex_gateway")
 REASONING_PATTERN = re.compile(r'model_reasoning_effort\s*=\s*(?:"[^"]*"|\'[^\']*\'|\S+)')
+MAX_CONTEXT_TURNS = 8
+MAX_CONTEXT_ENTRY_CHARS = 1600
+CHARS_PER_TOKEN_ESTIMATE = 4
 
 REASONING_BY_COMMAND: dict[str, str] = {
     "baixo": "low",
@@ -28,6 +38,154 @@ REASONING_BY_COMMAND: dict[str, str] = {
     "alto": "high",
     "altissimo": "xhigh",
 }
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _empty_usage_stats() -> dict[str, int]:
+    return {
+        "messages_sent": 0,
+        "responses_sent": 0,
+        "usage_samples": 0,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "estimated_billable_tokens": 0,
+    }
+
+
+def _usage_tuple_from_payload(payload: object) -> tuple[int, int, int] | None:
+    if not isinstance(payload, dict):
+        return None
+    input_tokens = _safe_int(payload.get("input_tokens"))
+    cached_input_tokens = _safe_int(payload.get("cached_input_tokens"))
+    output_tokens = _safe_int(payload.get("output_tokens"))
+    return input_tokens, cached_input_tokens, output_tokens
+
+
+def _add_usage_to_stats(stats: dict[str, int], usage: CodexUsage) -> None:
+    stats["usage_samples"] += 1
+    stats["input_tokens"] += max(usage.input_tokens, 0)
+    stats["cached_input_tokens"] += max(usage.cached_input_tokens, 0)
+    stats["output_tokens"] += max(usage.output_tokens, 0)
+    stats["estimated_billable_tokens"] += max(usage.estimated_billable_tokens, 0)
+
+
+def _load_usage_stats_from_history(path: Path) -> dict[str, int]:
+    stats = _empty_usage_stats()
+    if not path.exists():
+        return stats
+
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            event = payload.get("event")
+            if event == "codex_request":
+                stats["messages_sent"] += 1
+                continue
+            if event != "codex_response":
+                continue
+
+            stats["responses_sent"] += 1
+            usage_data = _usage_tuple_from_payload(payload.get("usage_tokens"))
+            if usage_data is None:
+                continue
+
+            input_tokens, cached_input_tokens, output_tokens = usage_data
+            _add_usage_to_stats(
+                stats,
+                CodexUsage(
+                    input_tokens=max(input_tokens, 0),
+                    cached_input_tokens=max(cached_input_tokens, 0),
+                    output_tokens=max(output_tokens, 0),
+                ),
+            )
+
+    return stats
+
+
+def _parse_iso_utc(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _load_gateway_tokens_last_days(path: Path, days: int = 7) -> int:
+    if days <= 0 or not path.exists():
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    total = 0
+    prompt_chars_by_request: dict[str, int] = {}
+
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            event_time = _parse_iso_utc(payload.get("timestamp_utc"))
+            if event_time is None or event_time < cutoff:
+                continue
+
+            event_name = payload.get("event")
+            if event_name == "codex_request":
+                request_id = payload.get("request_id")
+                prompt_text = payload.get("prompt", "")
+                if isinstance(request_id, str):
+                    prompt_chars_by_request[request_id] = len(str(prompt_text))
+                continue
+
+            if event_name != "codex_response":
+                continue
+
+            usage = payload.get("usage_tokens")
+            if not isinstance(usage, dict):
+                request_id = payload.get("request_id")
+                prompt_chars = prompt_chars_by_request.get(request_id, 0) if isinstance(request_id, str) else 0
+                response_chars = len(str(payload.get("response", "")))
+                estimated_chars = max(prompt_chars + response_chars, 0)
+                estimated_tokens = (estimated_chars + CHARS_PER_TOKEN_ESTIMATE - 1) // CHARS_PER_TOKEN_ESTIMATE
+                total += max(estimated_tokens, 0)
+                continue
+
+            estimated = _safe_int(usage.get("estimated_billable_tokens"))
+            if estimated <= 0:
+                input_tokens = _safe_int(usage.get("input_tokens"))
+                cached_input_tokens = _safe_int(usage.get("cached_input_tokens"))
+                output_tokens = _safe_int(usage.get("output_tokens"))
+                estimated = max(input_tokens - cached_input_tokens, 0) + max(output_tokens, 0)
+
+            total += max(estimated, 0)
+
+    return total
 
 
 def _configure_logging(settings: Settings) -> None:
@@ -118,6 +276,13 @@ def _persist_env_key(project_root: Path, key: str, value: str) -> None:
     env_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
 
 
+def _compact_text(text: str, max_chars: int = MAX_CONTEXT_ENTRY_CHARS) -> str:
+    normalized = (text or "").replace("\r\n", "\n").strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
 def build_bot(settings: Settings) -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
@@ -133,14 +298,18 @@ def build_bot(settings: Settings) -> commands.Bot:
         workdir=settings.codex_workdir,
         logger=logger,
     )
+    project_root = Path(__file__).resolve().parent.parent
+    attachments_root = (project_root / settings.attachments_temp_dir).resolve()
+    history_path = Path(settings.log_dir) / "history.jsonl"
+    usage_stats = _load_usage_stats_from_history(history_path)
+    history = HistoryLogger(history_path)
     state = {
         "codex_cmd": runtime_cmd,
         "codex_timeout_seconds": settings.codex_timeout_seconds,
         "codex_bridge": codex_bridge,
+        "context_by_channel": {},
+        "usage_stats": usage_stats,
     }
-    project_root = Path(__file__).resolve().parent.parent
-    attachments_root = (project_root / settings.attachments_temp_dir).resolve()
-    history = HistoryLogger(Path(settings.log_dir) / "history.jsonl")
 
     def _rebuild_bridge() -> None:
         state["codex_bridge"] = CodexBridge(
@@ -149,6 +318,86 @@ def build_bot(settings: Settings) -> commands.Bot:
             workdir=settings.codex_workdir,
             logger=logger,
         )
+
+    def _context_key(channel_id: int) -> str:
+        return str(channel_id)
+
+    def _context_turns_count(channel_id: int) -> int:
+        key = _context_key(channel_id)
+        return len(state["context_by_channel"].get(key, []))
+
+    def _reset_context(channel_id: int) -> int:
+        key = _context_key(channel_id)
+        removed = len(state["context_by_channel"].get(key, []))
+        state["context_by_channel"].pop(key, None)
+        return removed
+
+    def _append_context(channel_id: int, user_text: str, assistant_text: str) -> None:
+        key = _context_key(channel_id)
+        context_list = state["context_by_channel"].setdefault(key, [])
+        context_list.append(
+            {
+                "user": _compact_text(user_text),
+                "assistant": _compact_text(assistant_text),
+            }
+        )
+        if len(context_list) > MAX_CONTEXT_TURNS:
+            del context_list[:-MAX_CONTEXT_TURNS]
+
+    def _build_prompt_with_context(channel_id: int, latest_prompt: str) -> str:
+        key = _context_key(channel_id)
+        turns = state["context_by_channel"].get(key, [])
+
+        header = (
+            "Contexto: voce esta respondendo em um chat do Discord. "
+            "Seja objetivo e util, com formato curto quando possivel."
+        )
+
+        if not turns:
+            return header + "\n\nMensagem atual do usuario:\n" + latest_prompt
+
+        lines: list[str] = [header, "Historico recente (mais antigo -> mais novo):"]
+        for idx, turn in enumerate(turns, start=1):
+            lines.append(f"{idx}. Usuario: {turn['user']}")
+            lines.append(f"{idx}. Codex: {turn['assistant']}")
+        lines.append("Mensagem atual do usuario:")
+        lines.append(latest_prompt)
+        return "\n".join(lines)
+
+    def _estimate_tokens(text: str) -> int:
+        normalized = (text or "").strip()
+        if not normalized:
+            return 0
+        return max((len(normalized) + CHARS_PER_TOKEN_ESTIMATE - 1) // CHARS_PER_TOKEN_ESTIMATE, 1)
+
+    def _context_tokens_estimate(channel_id: int) -> int:
+        key = _context_key(channel_id)
+        turns = state["context_by_channel"].get(key, [])
+        if not turns:
+            return 0
+        lines: list[str] = []
+        for idx, turn in enumerate(turns, start=1):
+            lines.append(f"{idx}. Usuario: {turn['user']}")
+            lines.append(f"{idx}. Codex: {turn['assistant']}")
+        return _estimate_tokens("\n".join(lines))
+
+    def _percent_text(value: int, total: int) -> str:
+        if total <= 0:
+            return "0.0%"
+        return f"{(value / total) * 100:.1f}%"
+
+    def _format_usage_with_optional_total(value: int, total: int | None) -> str:
+        if total is None:
+            return f"{value}"
+        return f"{value} ({_percent_text(value, total)} de {total})"
+
+    def _format_remaining(total: int | None, used: int) -> str:
+        if total is None:
+            return "nao configurado"
+        remaining = total - used
+        if remaining >= 0:
+            return f"{remaining} ({_percent_text(remaining, total)} de {total})"
+        return f"0 (0.0% de {total}, excedido em {-remaining})"
 
     async def _handle_codex_prompt(
         message: discord.Message,
@@ -182,6 +431,7 @@ def build_bot(settings: Settings) -> commands.Bot:
                 "attachment_names": attachment_names,
             }
         )
+        state["usage_stats"]["messages_sent"] += 1
 
         logger.info(
             "request_id=%s source=%s received codex prompt with %s chars and %s attachments",
@@ -196,6 +446,7 @@ def build_bot(settings: Settings) -> commands.Bot:
         skipped_attachments: list[str] = []
         codex_prompt = normalized_prompt
         image_paths: list[str] = []
+        user_context_text = normalized_prompt
 
         try:
             if attachments_in_message:
@@ -212,13 +463,17 @@ def build_bot(settings: Settings) -> commands.Bot:
 
                 if collection.downloaded or collection.skipped:
                     attachment_lines = ["Arquivos anexados salvos localmente:"]
+                    sent_names: list[str] = []
                     for item in collection.downloaded:
                         kind = "imagem" if item.is_image else "arquivo"
+                        sent_names.append(item.original_name)
                         attachment_lines.append(
                             f"- {item.original_name} -> {item.saved_path} ({kind}, {item.size_bytes} bytes)"
                         )
                     for skipped in collection.skipped:
                         attachment_lines.append(f"- {skipped}")
+                    if sent_names:
+                        user_context_text = user_context_text + "\n[Anexos: " + ", ".join(sent_names) + "]"
                     attachment_lines.append("Use os caminhos acima para abrir/analisar os arquivos locais.")
                     if image_paths:
                         attachment_lines.append("As imagens tambem foram enviadas como input visual.")
@@ -226,7 +481,8 @@ def build_bot(settings: Settings) -> commands.Bot:
 
             async with message.channel.typing():
                 active_bridge: CodexBridge = state["codex_bridge"]
-                result = await asyncio.to_thread(active_bridge.run, codex_prompt, image_paths)
+                prompt_with_context = _build_prompt_with_context(message.channel.id, codex_prompt)
+                result = await asyncio.to_thread(active_bridge.run, prompt_with_context, image_paths)
         except Exception as exc:
             logger.exception("request_id=%s failed to execute codex command", request_id)
             history.write(
@@ -255,6 +511,19 @@ def build_bot(settings: Settings) -> commands.Bot:
             downloaded_count,
             len(skipped_attachments),
         )
+        _append_context(message.channel.id, user_context_text, result.text)
+
+        usage_payload: dict[str, int] | None = None
+        if result.usage is not None:
+            _add_usage_to_stats(state["usage_stats"], result.usage)
+            usage_payload = {
+                "input_tokens": max(result.usage.input_tokens, 0),
+                "cached_input_tokens": max(result.usage.cached_input_tokens, 0),
+                "output_tokens": max(result.usage.output_tokens, 0),
+                "estimated_billable_tokens": max(result.usage.estimated_billable_tokens, 0),
+            }
+        state["usage_stats"]["responses_sent"] += 1
+
         history.write(
             {
                 "event": "codex_response",
@@ -265,6 +534,8 @@ def build_bot(settings: Settings) -> commands.Bot:
                 "chunk_count": len(chunks),
                 "downloaded_attachments": downloaded_count,
                 "skipped_attachments": skipped_attachments,
+                "context_turns_after": _context_turns_count(message.channel.id),
+                "usage_tokens": usage_payload,
             }
         )
 
@@ -303,24 +574,73 @@ def build_bot(settings: Settings) -> commands.Bot:
             mention_author=False,
         )
 
-    def _status_text() -> str:
+    def _status_text(current_channel_id: int | None = None) -> str:
         current_effort = _extract_reasoning_effort(state["codex_cmd"])
         timeout_seconds = state["codex_timeout_seconds"]
-        channel_id = settings.allowed_channel_id if settings.allowed_channel_id is not None else "qualquer"
+        allowed_channel = settings.allowed_channel_id if settings.allowed_channel_id is not None else "qualquer"
         workdir = settings.codex_workdir or "(padrao do processo)"
         attachment_max_mb = settings.attachments_max_mb
         attachment_keep = settings.attachments_keep_files
         attachment_temp = settings.attachments_temp_dir
+        context_turns = _context_turns_count(current_channel_id) if isinstance(current_channel_id, int) else 0
+
+        def _fmt_int(value: int | None) -> str:
+            if not isinstance(value, int):
+                return "indisponivel"
+            return f"{value:,}".replace(",", ".")
+
+        def _fmt_pct(value: float | None) -> str:
+            if not isinstance(value, (int, float)):
+                return "indisponivel"
+            rounded = round(float(value), 1)
+            if rounded.is_integer():
+                return f"{int(rounded)}%"
+            return f"{rounded:.1f}%"
+
+        official_limits = read_official_rate_limits(timeout_seconds=6)
+        weekly_used_pct = official_limits.secondary_used_percent if official_limits is not None else None
+        short_used_pct = official_limits.primary_used_percent if official_limits is not None else None
+        weekly_available_pct = None if weekly_used_pct is None else max(100.0 - weekly_used_pct, 0.0)
+        short_available_pct = None if short_used_pct is None else max(100.0 - short_used_pct, 0.0)
+
+        gateway_week_tokens = _load_gateway_tokens_last_days(history_path, days=7)
+        local_week_tokens = read_local_total_tokens_last_days(days=7)
+        gateway_weekly_pct: float | None = None
+        if isinstance(weekly_used_pct, (int, float)) and isinstance(local_week_tokens, int) and local_week_tokens > 0:
+            gateway_share = min(max(gateway_week_tokens / local_week_tokens, 0.0), 1.0)
+            gateway_weekly_pct = float(weekly_used_pct) * gateway_share
+
+        latest_token_count = read_latest_token_count_snapshot()
+        if context_turns <= 0:
+            context_tokens_now: int | None = 0
+        elif latest_token_count is None:
+            context_tokens_now = None
+        else:
+            context_tokens_now = latest_token_count.last_tokens
+            if not isinstance(context_tokens_now, int):
+                context_tokens_now = latest_token_count.total_tokens
+
+        tokens_gateway_text = _fmt_int(gateway_week_tokens)
+        gateway_weekly_pct_text = _fmt_pct(gateway_weekly_pct)
+        context_tokens_text = _fmt_int(context_tokens_now)
+        weekly_available_text = _fmt_pct(weekly_available_pct)
+        short_available_text = _fmt_pct(short_available_pct)
+
         return (
             "Status atual:\n"
-            f"- reasoning: `{current_effort}`\n"
-            f"- timeout: `{timeout_seconds}s`\n"
-            f"- canal permitido: `{channel_id}`\n"
-            f"- workdir codex: `{workdir}`\n"
-            f"- pasta anexos: `{attachment_temp}`\n"
-            f"- anexos max: `{attachment_max_mb} MB`\n"
-            f"- anexos persistentes: `{attachment_keep}`\n"
-            "- entrada: mensagem normal ou `!codex <texto>`"
+            "1) Configuracao\n"
+            f"- reasoning: {current_effort}\n"
+            f"- timeout: {timeout_seconds}s\n"
+            f"- canal permitido: {allowed_channel}\n"
+            f"- workdir codex: {workdir}\n"
+            f"- pasta anexos: {attachment_temp}\n"
+            f"- anexos max: {attachment_max_mb} MB\n"
+            f"- anexos persistentes: {str(attachment_keep).lower()}\n"
+            "2) Metricas de Tokens\n"
+            f"- Janela de contexto: {context_turns} turnos ({context_tokens_text} tokens)\n"
+            f"- Tokens gastos pelo gateway: {tokens_gateway_text} tokens ({gateway_weekly_pct_text} da cota semanal, estimado)\n"
+            f"- Limite de uso (semanal): {weekly_available_text} disponivel\n"
+            f"- Limite de uso (5h): {short_available_text} disponivel"
         )
 
     @bot.event
@@ -376,6 +696,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             "- `!status` -> mostra configuracao atual\n"
             "- `!timeout <segundos>` -> altera timeout da execucao\n"
             "- `!reiniciar` -> reinicia processo do bot\n"
+            "- `!reset` -> limpa contexto da conversa neste canal\n"
             "- `!comandos` -> exemplos prontos\n"
             "- `!help` -> mostra esta mensagem\n\n"
             "Voce tambem pode mandar mensagem normal sem `!codex`.\n"
@@ -402,7 +723,8 @@ def build_bot(settings: Settings) -> commands.Bot:
 
     @bot.command(name="status")
     async def status(ctx: commands.Context[commands.Bot]) -> None:
-        await ctx.reply(_status_text(), mention_author=False)
+        text = await asyncio.to_thread(_status_text, ctx.channel.id)
+        await ctx.reply(text, mention_author=False)
 
     @bot.command(name="timeout")
     async def timeout_cmd(ctx: commands.Context[commands.Bot], seconds: str | None = None) -> None:
@@ -453,6 +775,22 @@ def build_bot(settings: Settings) -> commands.Bot:
             os.execv(sys.executable, [sys.executable, "-m", "src.bot"])
 
         asyncio.create_task(_restart())
+
+    @bot.command(name="reset")
+    async def reset(ctx: commands.Context[commands.Bot]) -> None:
+        removed_turns = _reset_context(ctx.channel.id)
+        history.write(
+            {
+                "event": "context_reset",
+                "user_id": ctx.author.id,
+                "channel_id": ctx.channel.id,
+                "removed_turns": removed_turns,
+            }
+        )
+        await ctx.reply(
+            f"Contexto resetado neste canal. Turnos removidos: `{removed_turns}`.",
+            mention_author=False,
+        )
 
     @bot.command(name="comandos")
     async def comandos(ctx: commands.Context[commands.Bot]) -> None:

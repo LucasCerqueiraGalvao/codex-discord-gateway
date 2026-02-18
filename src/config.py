@@ -20,6 +20,9 @@ class Settings:
     attachments_temp_dir: str
     attachments_max_mb: int
     attachments_keep_files: bool
+    token_budget_total: int | None
+    message_budget_total: int | None
+    context_window_tokens: int | None
 
 
 def _parse_int(name: str, value: str) -> int:
@@ -38,6 +41,16 @@ def _parse_bool(name: str, value: str) -> bool:
     raise RuntimeError(f"{name} must be a boolean (true/false).")
 
 
+def _parse_optional_positive_int(name: str, value: str) -> int | None:
+    raw = value.strip()
+    if not raw:
+        return None
+    parsed = _parse_int(name, raw)
+    if parsed <= 0:
+        raise RuntimeError(f"{name} must be greater than zero.")
+    return parsed
+
+
 def load_settings() -> Settings:
     load_dotenv()
 
@@ -53,6 +66,9 @@ def load_settings() -> Settings:
     attachments_temp_dir = os.getenv("ATTACHMENTS_TEMP_DIR", "runtime/attachments").strip() or "runtime/attachments"
     attachments_max_mb_raw = os.getenv("ATTACHMENTS_MAX_MB", "20").strip()
     attachments_keep_files_raw = os.getenv("ATTACHMENTS_KEEP_FILES", "false").strip()
+    token_budget_total_raw = os.getenv("TOKEN_BUDGET_TOTAL", "").strip()
+    message_budget_total_raw = os.getenv("MESSAGE_BUDGET_TOTAL", "").strip()
+    context_window_tokens_raw = os.getenv("CONTEXT_WINDOW_TOKENS", "").strip()
 
     if not token:
         raise RuntimeError("DISCORD_BOT_TOKEN is required.")
@@ -64,6 +80,9 @@ def load_settings() -> Settings:
     discord_chunk_size = _parse_int("DISCORD_CHUNK_SIZE", discord_chunk_size_raw)
     attachments_max_mb = _parse_int("ATTACHMENTS_MAX_MB", attachments_max_mb_raw)
     attachments_keep_files = _parse_bool("ATTACHMENTS_KEEP_FILES", attachments_keep_files_raw)
+    token_budget_total = _parse_optional_positive_int("TOKEN_BUDGET_TOTAL", token_budget_total_raw)
+    message_budget_total = _parse_optional_positive_int("MESSAGE_BUDGET_TOTAL", message_budget_total_raw)
+    context_window_tokens = _parse_optional_positive_int("CONTEXT_WINDOW_TOKENS", context_window_tokens_raw)
 
     if codex_timeout_seconds <= 0:
         raise RuntimeError("CODEX_TIMEOUT_SECONDS must be greater than zero.")
@@ -91,4 +110,7 @@ def load_settings() -> Settings:
         attachments_temp_dir=attachments_temp_dir,
         attachments_max_mb=attachments_max_mb,
         attachments_keep_files=attachments_keep_files,
+        token_budget_total=token_budget_total,
+        message_budget_total=message_budget_total,
+        context_window_tokens=context_window_tokens,
     )
