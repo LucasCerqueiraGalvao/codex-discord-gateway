@@ -15,6 +15,7 @@ from uuid import uuid4
 import discord
 from discord.ext import commands
 
+from .actions import ActionRegistry, render_action_result
 from .attachments import cleanup_attachments, download_attachments
 from .audio_transcriber import AudioTooLongError, AudioTranscriptionError, LocalAudioTranscriber
 from .codex_bridge import CodexBridge, CodexUsage
@@ -24,6 +25,10 @@ from .codex_official_status import (
     read_local_total_tokens_last_days,
     read_official_rate_limits,
 )
+from .codex_session_catalog import CodexSessionCatalog
+from .codex_thread_normalizer import CodexThreadNormalizer
+from .channel_sessions import ChannelSessionStore
+from .channel_workspace import ChannelWorkspaceManager
 from .history_log import HistoryLogger
 from .text_utils import split_for_discord
 
@@ -286,6 +291,22 @@ def _compact_text(text: str, max_chars: int = MAX_CONTEXT_ENTRY_CHARS) -> str:
     return normalized[: max_chars - 3].rstrip() + "..."
 
 
+def _build_thread_name(
+    *,
+    prompt: str,
+    channel_name: str | None = None,
+    attachment_names: list[str] | None = None,
+) -> str:
+    normalized = re.sub(r"\s+", " ", (prompt or "").strip())
+    if not normalized and attachment_names:
+        normalized = "Analisar " + ", ".join(name.strip() for name in attachment_names if name.strip())
+    if not normalized:
+        normalized = f"Discord {channel_name or 'channel'}"
+    if len(normalized) <= 72:
+        return normalized
+    return normalized[:69].rstrip() + "..."
+
+
 def build_bot(settings: Settings) -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
@@ -303,9 +324,17 @@ def build_bot(settings: Settings) -> commands.Bot:
     )
     project_root = Path(__file__).resolve().parent.parent
     attachments_root = (project_root / settings.attachments_temp_dir).resolve()
+    channel_workspaces_root = (project_root / "runtime" / "channel_workspaces").resolve()
+    channel_sessions_path = (project_root / "runtime" / "channel_sessions.json").resolve()
+    codex_session_index_path = (Path.home() / ".codex" / "session_index.jsonl").resolve()
+    codex_state_db_path = (Path.home() / ".codex" / "state_5.sqlite").resolve()
     history_path = Path(settings.log_dir) / "history.jsonl"
     usage_stats = _load_usage_stats_from_history(history_path)
     history = HistoryLogger(history_path)
+    channel_workspaces = ChannelWorkspaceManager(channel_workspaces_root)
+    channel_sessions = ChannelSessionStore(channel_sessions_path)
+    session_catalog = CodexSessionCatalog(codex_session_index_path)
+    thread_normalizer = CodexThreadNormalizer(codex_state_db_path)
     audio_transcriber = (
         LocalAudioTranscriber(
             model_name=settings.audio_stt_model,
@@ -317,6 +346,7 @@ def build_bot(settings: Settings) -> commands.Bot:
         if settings.audio_transcription_enabled
         else None
     )
+    action_registry = ActionRegistry(settings=settings, logger=logger)
     state = {
         "codex_cmd": runtime_cmd,
         "codex_timeout_seconds": settings.codex_timeout_seconds,
@@ -377,9 +407,14 @@ def build_bot(settings: Settings) -> commands.Bot:
         if len(context_list) > MAX_CONTEXT_TURNS:
             del context_list[:-MAX_CONTEXT_TURNS]
 
-    def _build_prompt_with_context(channel_id: int, latest_prompt: str) -> str:
+    def _build_prompt_with_context(
+        channel_id: int,
+        latest_prompt: str,
+        *,
+        include_recent_turns: bool = True,
+    ) -> str:
         key = _context_key(channel_id)
-        turns = state["context_by_channel"].get(key, [])
+        turns = state["context_by_channel"].get(key, []) if include_recent_turns else []
 
         header = (
             "Contexto: voce esta respondendo em um chat do Discord. "
@@ -450,6 +485,7 @@ def build_bot(settings: Settings) -> commands.Bot:
 
         request_id = uuid4().hex[:8]
         attachment_names = [attachment.filename for attachment in attachments_in_message]
+        channel_session = await asyncio.to_thread(channel_sessions.get, message.channel.id)
         history.write(
             {
                 "event": "codex_request",
@@ -460,16 +496,23 @@ def build_bot(settings: Settings) -> commands.Bot:
                 "prompt": original_prompt,
                 "attachment_count": len(attachments_in_message),
                 "attachment_names": attachment_names,
+                "session_id": channel_session.session_id if channel_session is not None else None,
             }
         )
         state["usage_stats"]["messages_sent"] += 1
+        workspace_info = channel_workspaces.ensure_workspace(
+            channel_id=message.channel.id,
+            channel_name=getattr(message.channel, "name", None),
+        )
+        active_workdir = str(channel_workspaces.root)
 
         logger.info(
-            "request_id=%s source=%s received codex prompt with %s chars and %s attachments",
+            "request_id=%s source=%s received codex prompt with %s chars, %s attachments, session_id=%s",
             request_id,
             source,
             len(normalized_prompt),
             len(attachments_in_message),
+            channel_session.session_id if channel_session is not None else "none",
         )
 
         collection = None
@@ -481,6 +524,9 @@ def build_bot(settings: Settings) -> commands.Bot:
         codex_prompt = normalized_prompt
         image_paths: list[str] = []
         user_context_text = normalized_prompt
+        execution_mode = "exec"
+        session_id_for_request = channel_session.session_id if channel_session is not None else None
+        thread_name_for_request = channel_session.thread_name if channel_session is not None else ""
 
         try:
             if attachments_in_message:
@@ -657,8 +703,61 @@ def build_bot(settings: Settings) -> commands.Bot:
 
             async with message.channel.typing():
                 active_bridge: CodexBridge = state["codex_bridge"]
-                prompt_with_context = _build_prompt_with_context(message.channel.id, codex_prompt)
-                result = await asyncio.to_thread(active_bridge.run, prompt_with_context, image_paths)
+                prompt_with_context = _build_prompt_with_context(
+                    message.channel.id,
+                    codex_prompt,
+                    include_recent_turns=channel_session is None,
+                )
+                if channel_session is not None:
+                    try:
+                        execution_mode = "resume"
+                        result = await asyncio.to_thread(
+                            active_bridge.resume,
+                            channel_session.session_id,
+                            prompt_with_context,
+                            image_paths,
+                            active_workdir,
+                        )
+                    except Exception as exc:
+                        execution_mode = "exec"
+                        logger.warning(
+                            "request_id=%s failed to resume session_id=%s; creating a new session instead: %s",
+                            request_id,
+                            channel_session.session_id,
+                            exc,
+                        )
+                        history.write(
+                            {
+                                "event": "codex_resume_failed",
+                                "request_id": request_id,
+                                "source": source,
+                                "channel_id": message.channel.id,
+                                "session_id": channel_session.session_id,
+                                "error": str(exc),
+                            }
+                        )
+                        await asyncio.to_thread(channel_sessions.remove, message.channel.id)
+                        channel_session = None
+                        session_id_for_request = None
+                        thread_name_for_request = ""
+                        prompt_with_context = _build_prompt_with_context(
+                            message.channel.id,
+                            codex_prompt,
+                            include_recent_turns=True,
+                        )
+                        result = await asyncio.to_thread(
+                            active_bridge.run,
+                            prompt_with_context,
+                            image_paths,
+                            active_workdir,
+                        )
+                else:
+                    result = await asyncio.to_thread(
+                        active_bridge.run,
+                        prompt_with_context,
+                        image_paths,
+                        active_workdir,
+                    )
         except Exception as exc:
             logger.exception("request_id=%s failed to execute codex command", request_id)
             history.write(
@@ -672,7 +771,22 @@ def build_bot(settings: Settings) -> commands.Bot:
                     "audio_attachment_count": audio_attachment_count,
                     "transcribed_audio_count": transcribed_audio_count,
                     "audio_errors": audio_errors,
+                    "workdir": active_workdir,
+                    "execution_mode": execution_mode,
+                    "session_id": session_id_for_request,
                 }
+            )
+            await asyncio.to_thread(
+                channel_workspaces.append_error,
+                info=workspace_info,
+                request_id=request_id,
+                source=source,
+                prompt=original_prompt or codex_prompt,
+                error=str(exc),
+                execution_mode=execution_mode,
+                execution_workdir=active_workdir,
+                session_id=session_id_for_request,
+                attachment_names=attachment_names,
             )
             await message.reply(f"Erro ao executar Codex: {exc}", mention_author=False)
             return
@@ -693,6 +807,44 @@ def build_bot(settings: Settings) -> commands.Bot:
         if not user_context_text:
             user_context_text = normalized_prompt
         _append_context(message.channel.id, user_context_text, result.text)
+
+        if result.session_id:
+            session_id_for_request = result.session_id
+        if not thread_name_for_request:
+            thread_name_for_request = _build_thread_name(
+                prompt=original_prompt or normalized_prompt or codex_prompt,
+                channel_name=getattr(message.channel, "name", None),
+                attachment_names=attachment_names,
+            )
+        if session_id_for_request:
+            try:
+                await asyncio.to_thread(
+                    thread_normalizer.normalize,
+                    session_id_for_request,
+                    cwd=active_workdir,
+                    source="vscode",
+                )
+            except Exception:
+                logger.warning(
+                    "request_id=%s failed to normalize Codex thread metadata for session_id=%s",
+                    request_id,
+                    session_id_for_request,
+                    exc_info=True,
+                )
+
+            updated_session = await asyncio.to_thread(
+                channel_sessions.set,
+                message.channel.id,
+                session_id_for_request,
+                thread_name_for_request,
+            )
+            thread_name_for_request = updated_session.thread_name
+            await asyncio.to_thread(
+                session_catalog.upsert,
+                updated_session.session_id,
+                updated_session.thread_name,
+                updated_session.updated_at,
+            )
 
         usage_payload: dict[str, int] | None = None
         if result.usage is not None:
@@ -720,12 +872,85 @@ def build_bot(settings: Settings) -> commands.Bot:
                 "audio_errors": audio_errors,
                 "context_turns_after": _context_turns_count(message.channel.id),
                 "usage_tokens": usage_payload,
+                "workdir": active_workdir,
+                "execution_mode": execution_mode,
+                "session_id": session_id_for_request,
+                "thread_name": thread_name_for_request,
             }
+        )
+        await asyncio.to_thread(
+            channel_workspaces.append_exchange,
+            info=workspace_info,
+            request_id=request_id,
+            source=source,
+            prompt=original_prompt or codex_prompt,
+            response=result.text,
+            command=result.command,
+            execution_mode=execution_mode,
+            execution_workdir=active_workdir,
+            session_id=session_id_for_request,
+            thread_name=thread_name_for_request,
+            attachment_names=attachment_names,
+            usage_tokens=usage_payload,
         )
 
         await message.reply(chunks[0], mention_author=False)
         for extra_chunk in chunks[1:]:
             await message.channel.send(extra_chunk)
+
+    async def _maybe_handle_standard_action(
+        message: discord.Message,
+        raw_text: str,
+        source: str,
+    ) -> bool:
+        invocation = action_registry.parse_invocation(raw_text)
+        if invocation is None:
+            return False
+
+        request_id = uuid4().hex[:8]
+        history.write(
+            {
+                "event": "standard_action_request",
+                "request_id": request_id,
+                "source": source,
+                "user_id": message.author.id,
+                "channel_id": message.channel.id,
+                "raw_text": raw_text,
+                "action_name": invocation.name,
+                "action_params": invocation.params,
+                "explicit_action_call": invocation.explicit,
+            }
+        )
+
+        logger.info(
+            "request_id=%s source=%s action=%s explicit=%s",
+            request_id,
+            source,
+            invocation.name,
+            invocation.explicit,
+        )
+
+        result = await action_registry.execute(message, invocation)
+        result_text = render_action_result(result)
+        chunks = split_for_discord(result_text, settings.discord_chunk_size)
+        await message.reply(chunks[0], mention_author=False)
+        for extra_chunk in chunks[1:]:
+            await message.channel.send(extra_chunk)
+
+        history.write(
+            {
+                "event": "standard_action_response",
+                "request_id": request_id,
+                "source": source,
+                "action_name": result.action,
+                "ok": result.ok,
+                "status": result.status,
+                "message": result.message,
+                "data": result.data,
+                "chunk_count": len(chunks),
+            }
+        )
+        return True
 
     async def _set_reasoning(
         ctx: commands.Context[commands.Bot],
@@ -762,7 +987,18 @@ def build_bot(settings: Settings) -> commands.Bot:
         current_effort = _extract_reasoning_effort(state["codex_cmd"])
         timeout_seconds = state["codex_timeout_seconds"]
         allowed_channel = settings.allowed_channel_id if settings.allowed_channel_id is not None else "qualquer"
-        workdir = settings.codex_workdir or "(padrao do processo)"
+        bridge_workdir = settings.codex_workdir or "(padrao do processo)"
+        discord_workspace_root = str(channel_workspaces.root)
+        channel_workspace = (
+            str(channel_workspaces.ensure_workspace(current_channel_id).workspace_dir)
+            if isinstance(current_channel_id, int)
+            else "(selecione um canal)"
+        )
+        active_session = (
+            channel_sessions.get(current_channel_id)
+            if isinstance(current_channel_id, int)
+            else None
+        )
         attachment_max_mb = settings.attachments_max_mb
         attachment_keep = settings.attachments_keep_files
         attachment_temp = settings.attachments_temp_dir
@@ -816,7 +1052,12 @@ def build_bot(settings: Settings) -> commands.Bot:
             f"- reasoning: {current_effort}\n"
             f"- timeout: {timeout_seconds}s\n"
             f"- canal permitido: {allowed_channel}\n"
-            f"- workdir codex: {workdir}\n"
+            f"- workdir base do bridge: {bridge_workdir}\n"
+            f"- raiz de workspaces: {channel_workspaces.root}\n"
+            f"- cwd usado nas sessoes Discord: {discord_workspace_root}\n"
+            f"- pasta de artefatos deste canal: {channel_workspace}\n"
+            f"- sessao ativa deste canal: {active_session.session_id if active_session else 'nenhuma'}\n"
+            f"- titulo indexado: {active_session.thread_name if active_session else 'nenhum'}\n"
             f"- pasta anexos: {attachment_temp}\n"
             f"- anexos max: {attachment_max_mb} MB\n"
             f"- anexos persistentes: {str(attachment_keep).lower()}\n"
@@ -850,6 +1091,15 @@ def build_bot(settings: Settings) -> commands.Bot:
             await _handle_codex_prompt(message, prompt, source="bang_command")
             return
 
+        if content:
+            handled_by_action = await _maybe_handle_standard_action(
+                message,
+                content,
+                source="bang_action" if content.startswith("!") else "plain_action",
+            )
+            if handled_by_action:
+                return
+
         if content.startswith("!"):
             await bot.process_commands(message)
             return
@@ -880,15 +1130,25 @@ def build_bot(settings: Settings) -> commands.Bot:
             "- `!status` -> mostra configuracao atual\n"
             "- `!timeout <segundos>` -> altera timeout da execucao\n"
             "- `!reiniciar` -> reinicia processo do bot\n"
-            "- `!reset` -> limpa contexto da conversa neste canal\n"
+            "- `!reset` / `!newchat` -> inicia uma nova conversa do Codex neste canal\n"
+            "- `!acoes` / `!actions` -> lista acoes padronizadas\n"
             "- `!comandos` -> exemplos prontos\n"
             "- `!help` -> mostra esta mensagem\n\n"
             "Voce tambem pode mandar mensagem normal sem `!codex`.\n"
+            "Acoes padronizadas por texto: `find_file`, `upload_file`, `create_script`.\n"
             "Voice message/arquivo de audio tambem vira prompt via transcricao local.\n"
             "Anexos (txt, py, pdf, imagens etc.) sao baixados e enviados para analise.\n"
             f"Nivel atual: `{current_effort}`"
         )
         await ctx.reply(text, mention_author=False)
+
+    @bot.command(name="acoes", aliases=["actions"])
+    async def acoes_cmd(ctx: commands.Context[commands.Bot]) -> None:
+        text = action_registry.build_actions_help_text()
+        chunks = split_for_discord(text, settings.discord_chunk_size)
+        await ctx.reply(chunks[0], mention_author=False)
+        for extra_chunk in chunks[1:]:
+            await ctx.send(extra_chunk)
 
     @bot.command(name="baixo")
     async def baixo(ctx: commands.Context[commands.Bot]) -> None:
@@ -961,19 +1221,29 @@ def build_bot(settings: Settings) -> commands.Bot:
 
         asyncio.create_task(_restart())
 
-    @bot.command(name="reset")
+    @bot.command(name="reset", aliases=["newchat"])
     async def reset(ctx: commands.Context[commands.Bot]) -> None:
         removed_turns = _reset_context(ctx.channel.id)
+        removed_session = await asyncio.to_thread(channel_sessions.remove, ctx.channel.id)
         history.write(
             {
                 "event": "context_reset",
                 "user_id": ctx.author.id,
                 "channel_id": ctx.channel.id,
                 "removed_turns": removed_turns,
+                "removed_session_id": removed_session.session_id if removed_session else None,
             }
         )
+        if removed_session is None:
+            session_text = "Nenhuma sessao persistente ativa estava vinculada a este canal."
+        else:
+            session_text = f"Sessao anterior desvinculada: `{removed_session.session_id}`."
         await ctx.reply(
-            f"Contexto resetado neste canal. Turnos removidos: `{removed_turns}`.",
+            (
+                "Nova conversa preparada para este canal.\n"
+                f"- turnos locais removidos: `{removed_turns}`\n"
+                f"- {session_text}"
+            ),
             mention_author=False,
         )
 
@@ -981,10 +1251,13 @@ def build_bot(settings: Settings) -> commands.Bot:
     async def comandos(ctx: commands.Context[commands.Bot]) -> None:
         text = (
             "Exemplos prontos:\n"
+            "- `find_file name=\"README.md\" root=\"C:/Users/lucas/Documents/Projects\"`\n"
+            "- `upload_file path=\"C:/Users/lucas/Desktop/relatorio.pdf\"`\n"
+            "- `create_script name=\"merge_excels\" language=\"python\"`\n"
             "- `liste os atalhos da minha area de trabalho`\n"
             "- `procure na pasta Downloads arquivos .pdf e me diga os 10 mais recentes`\n"
             "- `crie um script python que renomeia arquivos .txt com data e salve em C:/Users/lucas/Desktop`\n"
-            "- `faça um resumo do arquivo C:/Users/lucas/Desktop/anotacoes.txt`\n"
+            "- `faca um resumo do arquivo C:/Users/lucas/Desktop/anotacoes.txt`\n"
             "- `gere um plano de tarefas para hoje com base no arquivo C:/Users/lucas/Desktop/todo.txt`"
         )
         await ctx.reply(text, mention_author=False)
@@ -1008,3 +1281,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
