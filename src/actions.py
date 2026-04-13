@@ -73,14 +73,6 @@ class ActionRegistry:
             settings.stable_auto_image_script_path,
             default=self._project_root.parent / "stable-diffusion" / "generate_auto_image.py",
         )
-        legacy_stable_auto_image_script_path = (
-            self._project_root.parent / "stable diffusion" / "generate_auto_image.py"
-        ).resolve(strict=False)
-        if (
-            not self._stable_auto_image_script_path.exists()
-            and legacy_stable_auto_image_script_path.exists()
-        ):
-            self._stable_auto_image_script_path = legacy_stable_auto_image_script_path
         self._definitions: dict[str, ActionDefinition] = {
             "find_file": ActionDefinition(
                 name="find_file",
