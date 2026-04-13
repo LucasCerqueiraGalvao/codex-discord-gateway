@@ -127,7 +127,7 @@ codex exec --skip-git-repo-check --json --sandbox danger-full-access -c model_re
 ```
 
 Se `AGENT_SCRIPTS_ROOT` estiver vazio, o bot usa por padrao uma pasta `agent_scripts` na raiz de `Projects`.
-Se `STABLE_AUTO_IMAGE_SCRIPT_PATH` estiver vazio, o bot tenta usar o script irmao em `../stable diffusion/generate_auto_image.py`.
+Se `STABLE_AUTO_IMAGE_SCRIPT_PATH` estiver vazio, o bot tenta usar o script irmao em `../stable-diffusion/generate_auto_image.py`.
 
 ## Workspaces por canal
 

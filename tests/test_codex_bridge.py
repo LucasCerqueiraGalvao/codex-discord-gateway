@@ -138,7 +138,7 @@ class CodexBridgeTests(unittest.TestCase):
     def test_extract_artifacts_from_assistant_markdown_link_with_encoded_spaces(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-            spaced_dir = tmp_path / "stable diffusion"
+            spaced_dir = tmp_path / "stable-diffusion"
             spaced_dir.mkdir()
             artifact_path = (spaced_dir / "image final.png").resolve()
             artifact_path.write_bytes(b"png")
@@ -183,7 +183,7 @@ class CodexBridgeTests(unittest.TestCase):
                             "arguments": json.dumps(
                                 {
                                     "command": (
-                                        'python "C:\\Users\\lucas\\Documents\\Projects\\personal\\stable diffusion'
+                                        'python "C:\\Users\\lucas\\Documents\\Projects\\personal\\stable-diffusion'
                                         '\\generate_auto_image.py" --main-prompt "hero skyline" '
                                         '--face-prompt "sharp face" --negative-prompt "bad hands" '
                                         '--face-negative-prompt "bad face" --json'
@@ -231,7 +231,7 @@ class CodexBridgeTests(unittest.TestCase):
                 "face_prompt = 'sharp face'\n"
                 "neg = 'bad hands'\n"
                 "face_neg = 'bad face'\n"
-                "subprocess.run(['python', r'C:\\Users\\lucas\\Documents\\Projects\\personal\\stable diffusion\\generate_auto_image.py'])\n"
+                "subprocess.run(['python', r'C:\\Users\\lucas\\Documents\\Projects\\personal\\stable-diffusion\\generate_auto_image.py'])\n"
                 "'@ | python -"
             )
             lines = [
