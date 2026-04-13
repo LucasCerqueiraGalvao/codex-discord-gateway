@@ -97,30 +97,33 @@ class CodexThreadNormalizer:
         if not rollout_path.exists():
             return
 
-        updated_lines: list[str] = []
-        for raw_line in rollout_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                updated_lines.append(raw_line)
-                continue
-
-            event_type = payload.get("type")
-            if event_type == "session_meta":
-                event_payload = payload.get("payload")
-                if isinstance(event_payload, dict) and event_payload.get("id") == session_id:
-                    event_payload["cwd"] = cwd
-                    event_payload["source"] = source
-            elif event_type == "turn_context":
-                event_payload = payload.get("payload")
-                if isinstance(event_payload, dict):
-                    event_payload["cwd"] = cwd
-
-            updated_lines.append(json.dumps(payload, ensure_ascii=False))
-
         temp_path = rollout_path.with_suffix(rollout_path.suffix + ".tmp")
-        temp_path.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
-        temp_path.replace(rollout_path)
+        try:
+            updated_lines: list[str] = []
+            for raw_line in rollout_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    updated_lines.append(raw_line)
+                    continue
+
+                event_type = payload.get("type")
+                if event_type == "session_meta":
+                    event_payload = payload.get("payload")
+                    if isinstance(event_payload, dict) and event_payload.get("id") == session_id:
+                        event_payload["cwd"] = cwd
+                        event_payload["source"] = source
+                elif event_type == "turn_context":
+                    event_payload = payload.get("payload")
+                    if isinstance(event_payload, dict):
+                        event_payload["cwd"] = cwd
+
+                updated_lines.append(json.dumps(payload, ensure_ascii=False))
+
+            temp_path.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
+            temp_path.replace(rollout_path)
+        except PermissionError:
+            temp_path.unlink(missing_ok=True)

@@ -14,6 +14,8 @@ class Settings:
     codex_cmd: str | None
     codex_timeout_seconds: int
     codex_workdir: str | None
+    agent_scripts_root: str | None
+    stable_auto_image_script_path: str | None
     discord_chunk_size: int
     log_level: str
     log_dir: str
@@ -68,6 +70,10 @@ def load_settings() -> Settings:
     codex_cmd = os.getenv("CODEX_CMD", "").strip() or None
     codex_timeout_raw = os.getenv("CODEX_TIMEOUT_SECONDS", "120").strip()
     codex_workdir = os.getenv("CODEX_WORKDIR", "").strip() or None
+    agent_scripts_root = os.getenv("AGENT_SCRIPTS_ROOT", "").strip() or None
+    stable_auto_image_script_path = (
+        os.getenv("STABLE_AUTO_IMAGE_SCRIPT_PATH", "").strip() or None
+    )
     discord_chunk_size_raw = os.getenv("DISCORD_CHUNK_SIZE", "1900").strip()
     log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
     log_dir = os.getenv("LOG_DIR", "logs").strip() or "logs"
@@ -131,6 +137,8 @@ def load_settings() -> Settings:
         codex_cmd=codex_cmd,
         codex_timeout_seconds=codex_timeout_seconds,
         codex_workdir=codex_workdir,
+        agent_scripts_root=agent_scripts_root,
+        stable_auto_image_script_path=stable_auto_image_script_path,
         discord_chunk_size=discord_chunk_size,
         log_level=log_level,
         log_dir=log_dir,

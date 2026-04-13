@@ -18,7 +18,7 @@ from discord.ext import commands
 from .actions import ActionRegistry, render_action_result
 from .attachments import cleanup_attachments, download_attachments
 from .audio_transcriber import AudioTooLongError, AudioTranscriptionError, LocalAudioTranscriber
-from .codex_bridge import CodexBridge, CodexUsage
+from .codex_bridge import CodexArtifact, CodexBridge, CodexResult, CodexUsage
 from .config import Settings, load_settings
 from .codex_official_status import (
     read_latest_token_count_snapshot,
@@ -30,6 +30,8 @@ from .codex_thread_normalizer import CodexThreadNormalizer
 from .channel_sessions import ChannelSessionStore
 from .channel_workspace import ChannelWorkspaceManager
 from .history_log import HistoryLogger
+from .single_instance import SingleInstanceLock
+from .stable_state import StablePromptBundle, StableStateStore
 from .text_utils import split_for_discord
 
 
@@ -39,6 +41,9 @@ MAX_CONTEXT_TURNS = 8
 MAX_CONTEXT_ENTRY_CHARS = 1600
 CHARS_PER_TOKEN_ESTIMATE = 4
 AUDIO_RATE_WINDOW_SECONDS = 60
+MAX_RECENT_MESSAGE_IDS = 256
+
+_PROCESS_LOCK: SingleInstanceLock | None = None
 
 REASONING_BY_COMMAND: dict[str, str] = {
     "baixo": "low",
@@ -307,6 +312,110 @@ def _build_thread_name(
     return normalized[:69].rstrip() + "..."
 
 
+def _select_upload_artifact(
+    artifacts: tuple[CodexArtifact, ...],
+    max_bytes: int,
+) -> tuple[CodexArtifact | None, list[dict[str, object]]]:
+    diagnostics: list[dict[str, object]] = []
+
+    for artifact in artifacts:
+        entry: dict[str, object] = {
+            "path": artifact.path,
+            "source": artifact.source,
+            "priority": artifact.priority,
+            "label": artifact.label,
+            "status": "discarded",
+        }
+        path = Path(artifact.path)
+
+        try:
+            exists = path.exists()
+        except OSError:
+            exists = False
+
+        if not exists:
+            entry["reason"] = "missing"
+            diagnostics.append(entry)
+            continue
+
+        try:
+            is_file = path.is_file()
+        except OSError:
+            is_file = False
+
+        if not is_file:
+            entry["reason"] = "not_file"
+            diagnostics.append(entry)
+            continue
+
+        try:
+            size_bytes = path.stat().st_size
+        except OSError:
+            entry["reason"] = "missing"
+            diagnostics.append(entry)
+            continue
+
+        entry["size_bytes"] = size_bytes
+        if size_bytes > max_bytes:
+            entry["reason"] = "too_large"
+            diagnostics.append(entry)
+            continue
+
+        entry["status"] = "selected"
+        diagnostics.append(entry)
+        return artifact, diagnostics
+
+    return None, diagnostics
+
+
+def _build_response_text(result_text: str, artifact: CodexArtifact | None) -> str:
+    normalized = (result_text or "").strip()
+    if normalized:
+        return normalized
+    if artifact is None:
+        return result_text
+    return f"Arquivo gerado anexado automaticamente: {Path(artifact.path).name}"
+
+
+def _save_stable_state(
+    stable_state_store: StableStateStore,
+    channel_id: int,
+    bundle: StablePromptBundle,
+) -> StablePromptBundle:
+    return stable_state_store.set(channel_id, bundle)
+
+
+def _prepare_codex_stable_bundle(
+    result: CodexResult,
+    artifact: CodexArtifact | None,
+) -> StablePromptBundle | None:
+    if artifact is None or result.prompt_bundle is None:
+        return None
+    return result.prompt_bundle.with_updates(
+        last_image_path=artifact.path,
+        source="codex_auto_image",
+    )
+
+
+async def _send_discord_response(
+    message: discord.Message,
+    text: str,
+    chunk_size: int,
+    *,
+    artifact_path: Path | None = None,
+) -> int:
+    chunks = split_for_discord(text, chunk_size)
+    if artifact_path is not None:
+        file_to_send = discord.File(str(artifact_path), filename=artifact_path.name)
+        await message.reply(chunks[0], mention_author=False, file=file_to_send)
+    else:
+        await message.reply(chunks[0], mention_author=False)
+
+    for extra_chunk in chunks[1:]:
+        await message.channel.send(extra_chunk)
+    return len(chunks)
+
+
 def build_bot(settings: Settings) -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
@@ -326,6 +435,7 @@ def build_bot(settings: Settings) -> commands.Bot:
     attachments_root = (project_root / settings.attachments_temp_dir).resolve()
     channel_workspaces_root = (project_root / "runtime" / "channel_workspaces").resolve()
     channel_sessions_path = (project_root / "runtime" / "channel_sessions.json").resolve()
+    stable_state_root = (project_root / "runtime" / "stable_state").resolve()
     codex_session_index_path = (Path.home() / ".codex" / "session_index.jsonl").resolve()
     codex_state_db_path = (Path.home() / ".codex" / "state_5.sqlite").resolve()
     history_path = Path(settings.log_dir) / "history.jsonl"
@@ -333,6 +443,7 @@ def build_bot(settings: Settings) -> commands.Bot:
     history = HistoryLogger(history_path)
     channel_workspaces = ChannelWorkspaceManager(channel_workspaces_root)
     channel_sessions = ChannelSessionStore(channel_sessions_path)
+    stable_state_store = StableStateStore(stable_state_root)
     session_catalog = CodexSessionCatalog(codex_session_index_path)
     thread_normalizer = CodexThreadNormalizer(codex_state_db_path)
     audio_transcriber = (
@@ -346,7 +457,11 @@ def build_bot(settings: Settings) -> commands.Bot:
         if settings.audio_transcription_enabled
         else None
     )
-    action_registry = ActionRegistry(settings=settings, logger=logger)
+    action_registry = ActionRegistry(
+        settings=settings,
+        stable_state_store=stable_state_store,
+        logger=logger,
+    )
     state = {
         "codex_cmd": runtime_cmd,
         "codex_timeout_seconds": settings.codex_timeout_seconds,
@@ -354,6 +469,9 @@ def build_bot(settings: Settings) -> commands.Bot:
         "context_by_channel": {},
         "usage_stats": usage_stats,
         "audio_rate_window": defaultdict(deque),
+        "message_inflight_ids": set(),
+        "recent_message_id_order": deque(),
+        "recent_message_id_set": set(),
     }
 
     def _rebuild_bridge() -> None:
@@ -366,6 +484,31 @@ def build_bot(settings: Settings) -> commands.Bot:
 
     def _context_key(channel_id: int) -> str:
         return str(channel_id)
+
+    def _begin_message_processing(message_id: int) -> bool:
+        inflight: set[int] = state["message_inflight_ids"]
+        recent: set[int] = state["recent_message_id_set"]
+        if message_id in inflight or message_id in recent:
+            return False
+        inflight.add(message_id)
+        return True
+
+    def _finish_message_processing(message_id: int) -> None:
+        inflight: set[int] = state["message_inflight_ids"]
+        inflight.discard(message_id)
+
+        recent_order: deque[int] = state["recent_message_id_order"]
+        recent_set: set[int] = state["recent_message_id_set"]
+        if message_id in recent_set:
+            return
+
+        recent_order.append(message_id)
+        recent_set.add(message_id)
+        while len(recent_order) > MAX_RECENT_MESSAGE_IDS:
+            recent_set.discard(recent_order.popleft())
+
+    def _resume_downgraded_to_read_only(result: CodexResult, bridge: CodexBridge) -> bool:
+        return bridge.prefers_danger_full_access() and result.sandbox_policy == "read-only"
 
     def _reserve_audio_rate_slot(user_id: int, slots: int = 1) -> tuple[bool, float]:
         # Sliding window limiter: X transcriptions per 60s.
@@ -416,19 +559,14 @@ def build_bot(settings: Settings) -> commands.Bot:
         key = _context_key(channel_id)
         turns = state["context_by_channel"].get(key, []) if include_recent_turns else []
 
-        header = (
-            "Contexto: voce esta respondendo em um chat do Discord. "
-            "Seja objetivo e util, com formato curto quando possivel."
-        )
-
         if not turns:
-            return header + "\n\nMensagem atual do usuario:\n" + latest_prompt
+            return latest_prompt
 
-        lines: list[str] = [header, "Historico recente (mais antigo -> mais novo):"]
+        lines: list[str] = ["Historico recente:"]
         for idx, turn in enumerate(turns, start=1):
             lines.append(f"{idx}. Usuario: {turn['user']}")
             lines.append(f"{idx}. Codex: {turn['assistant']}")
-        lines.append("Mensagem atual do usuario:")
+        lines.append("Pedido atual:")
         lines.append(latest_prompt)
         return "\n".join(lines)
 
@@ -448,6 +586,21 @@ def build_bot(settings: Settings) -> commands.Bot:
             lines.append(f"{idx}. Usuario: {turn['user']}")
             lines.append(f"{idx}. Codex: {turn['assistant']}")
         return _estimate_tokens("\n".join(lines))
+
+    def _save_codex_stable_state(
+        channel_id: int,
+        result: CodexResult,
+        artifact: CodexArtifact | None,
+    ) -> StablePromptBundle | None:
+        prepared_bundle = _prepare_codex_stable_bundle(result, artifact)
+        if prepared_bundle is None:
+            return None
+
+        return _save_stable_state(
+            stable_state_store,
+            channel_id,
+            prepared_bundle,
+        )
 
     def _percent_text(value: int, total: int) -> str:
         if total <= 0:
@@ -718,6 +871,39 @@ def build_bot(settings: Settings) -> commands.Bot:
                             image_paths,
                             active_workdir,
                         )
+                        if _resume_downgraded_to_read_only(result, active_bridge):
+                            execution_mode = "exec"
+                            logger.warning(
+                                "request_id=%s resumed session_id=%s in read-only; recreating session with a fresh exec",
+                                request_id,
+                                channel_session.session_id,
+                            )
+                            history.write(
+                                {
+                                    "event": "codex_resume_sandbox_downgraded",
+                                    "request_id": request_id,
+                                    "source": source,
+                                    "channel_id": message.channel.id,
+                                    "session_id": channel_session.session_id,
+                                    "observed_sandbox_policy": result.sandbox_policy,
+                                    "command": result.command,
+                                }
+                            )
+                            await asyncio.to_thread(channel_sessions.remove, message.channel.id)
+                            channel_session = None
+                            session_id_for_request = None
+                            thread_name_for_request = ""
+                            prompt_with_context = _build_prompt_with_context(
+                                message.channel.id,
+                                codex_prompt,
+                                include_recent_turns=True,
+                            )
+                            result = await asyncio.to_thread(
+                                active_bridge.run,
+                                prompt_with_context,
+                                image_paths,
+                                active_workdir,
+                            )
                     except Exception as exc:
                         execution_mode = "exec"
                         logger.warning(
@@ -758,6 +944,22 @@ def build_bot(settings: Settings) -> commands.Bot:
                         image_paths,
                         active_workdir,
                     )
+
+                if execution_mode == "exec" and active_bridge.prefers_danger_full_access() and result.sandbox_policy == "read-only":
+                    logger.warning(
+                        "request_id=%s fresh exec still returned read-only despite full-access preference",
+                        request_id,
+                    )
+                    history.write(
+                        {
+                            "event": "codex_exec_sandbox_mismatch",
+                            "request_id": request_id,
+                            "source": source,
+                            "channel_id": message.channel.id,
+                            "observed_sandbox_policy": result.sandbox_policy,
+                            "command": result.command,
+                        }
+                    )
         except Exception as exc:
             logger.exception("request_id=%s failed to execute codex command", request_id)
             history.write(
@@ -774,6 +976,7 @@ def build_bot(settings: Settings) -> commands.Bot:
                     "workdir": active_workdir,
                     "execution_mode": execution_mode,
                     "session_id": session_id_for_request,
+                    "sandbox_policy": result.sandbox_policy if "result" in locals() else None,
                 }
             )
             await asyncio.to_thread(
@@ -794,19 +997,34 @@ def build_bot(settings: Settings) -> commands.Bot:
             if collection is not None and not settings.attachments_keep_files:
                 await asyncio.to_thread(cleanup_attachments, collection.request_dir)
 
-        chunks = split_for_discord(result.text, settings.discord_chunk_size)
+        selected_artifact, artifact_diagnostics = _select_upload_artifact(
+            result.artifacts,
+            settings.attachments_max_mb * 1024 * 1024,
+        )
+        artifact_payload: dict[str, object] = {
+            "detected_count": len(result.artifacts),
+            "selected_path": selected_artifact.path if selected_artifact is not None else None,
+            "selected_source": selected_artifact.source if selected_artifact is not None else None,
+            "selected_priority": selected_artifact.priority if selected_artifact is not None else None,
+            "status": "not_detected" if not result.artifacts else "discarded",
+            "discarded": [entry for entry in artifact_diagnostics if entry.get("status") == "discarded"],
+        }
+        response_text = _build_response_text(result.text, selected_artifact)
+        chunks = split_for_discord(response_text, settings.discord_chunk_size)
         logger.info(
-            "request_id=%s response chars=%s split_chunks=%s command=%s downloaded_attachments=%s skipped_attachments=%s",
+            "request_id=%s response chars=%s split_chunks=%s command=%s downloaded_attachments=%s skipped_attachments=%s artifact_detected=%s artifact_selected=%s",
             request_id,
-            len(result.text),
+            len(response_text),
             len(chunks),
             result.command,
             downloaded_count,
             len(skipped_attachments),
+            len(result.artifacts),
+            selected_artifact.path if selected_artifact is not None else "none",
         )
         if not user_context_text:
             user_context_text = normalized_prompt
-        _append_context(message.channel.id, user_context_text, result.text)
+        _append_context(message.channel.id, user_context_text, response_text)
 
         if result.session_id:
             session_id_for_request = result.session_id
@@ -857,13 +1075,95 @@ def build_bot(settings: Settings) -> commands.Bot:
             }
         state["usage_stats"]["responses_sent"] += 1
 
+        saved_stable_bundle: StablePromptBundle | None = None
+        if selected_artifact is not None and result.prompt_bundle is not None:
+            try:
+                saved_stable_bundle = await asyncio.to_thread(
+                    _save_codex_stable_state,
+                    message.channel.id,
+                    result,
+                    selected_artifact,
+                )
+            except Exception:
+                logger.warning(
+                    "request_id=%s failed to persist stable prompt bundle for channel_id=%s",
+                    request_id,
+                    message.channel.id,
+                    exc_info=True,
+                )
+            else:
+                history.write(
+                    {
+                        "event": "stable_state_saved",
+                        "request_id": request_id,
+                        "source": source,
+                        "channel_id": message.channel.id,
+                        "state_path": str(stable_state_store.path_for(message.channel.id)),
+                        "state_source": saved_stable_bundle.source,
+                        "last_image_path": saved_stable_bundle.last_image_path,
+                    }
+                )
+
+        try:
+            if selected_artifact is not None:
+                artifact_payload["status"] = "uploaded"
+                await _send_discord_response(
+                    message,
+                    response_text,
+                    settings.discord_chunk_size,
+                    artifact_path=Path(selected_artifact.path),
+                )
+            else:
+                await _send_discord_response(
+                    message,
+                    response_text,
+                    settings.discord_chunk_size,
+                )
+        except Exception as exc:
+            if selected_artifact is None:
+                raise
+
+            artifact_payload["status"] = "upload_error"
+            artifact_payload["error"] = str(exc)
+            logger.warning(
+                "request_id=%s failed to upload artifact=%s; falling back to text-only response: %s",
+                request_id,
+                selected_artifact.path,
+                exc,
+            )
+            await _send_discord_response(
+                message,
+                response_text,
+                settings.discord_chunk_size,
+            )
+
+        logger.info(
+            "request_id=%s artifact_upload_status=%s artifact_path=%s",
+            request_id,
+            artifact_payload["status"],
+            artifact_payload["selected_path"] or "none",
+        )
+        history.write(
+            {
+                "event": "codex_artifact_upload",
+                "request_id": request_id,
+                "source": source,
+                "detected_count": len(result.artifacts),
+                "selected_path": artifact_payload["selected_path"],
+                "selected_source": artifact_payload["selected_source"],
+                "selected_priority": artifact_payload["selected_priority"],
+                "status": artifact_payload["status"],
+                "discarded": artifact_payload["discarded"],
+                "error": artifact_payload.get("error"),
+            }
+        )
         history.write(
             {
                 "event": "codex_response",
                 "request_id": request_id,
                 "source": source,
                 "command": result.command,
-                "response": result.text,
+                "response": response_text,
                 "chunk_count": len(chunks),
                 "downloaded_attachments": downloaded_count,
                 "skipped_attachments": skipped_attachments,
@@ -876,6 +1176,10 @@ def build_bot(settings: Settings) -> commands.Bot:
                 "execution_mode": execution_mode,
                 "session_id": session_id_for_request,
                 "thread_name": thread_name_for_request,
+                "sandbox_policy": result.sandbox_policy,
+                "artifact_upload": artifact_payload,
+                "stable_state_saved": saved_stable_bundle is not None,
+                "stable_state_source": saved_stable_bundle.source if saved_stable_bundle else None,
             }
         )
         await asyncio.to_thread(
@@ -884,7 +1188,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             request_id=request_id,
             source=source,
             prompt=original_prompt or codex_prompt,
-            response=result.text,
+            response=response_text,
             command=result.command,
             execution_mode=execution_mode,
             execution_workdir=active_workdir,
@@ -893,10 +1197,6 @@ def build_bot(settings: Settings) -> commands.Bot:
             attachment_names=attachment_names,
             usage_tokens=usage_payload,
         )
-
-        await message.reply(chunks[0], mention_author=False)
-        for extra_chunk in chunks[1:]:
-            await message.channel.send(extra_chunk)
 
     async def _maybe_handle_standard_action(
         message: discord.Message,
@@ -918,9 +1218,22 @@ def build_bot(settings: Settings) -> commands.Bot:
                 "raw_text": raw_text,
                 "action_name": invocation.name,
                 "action_params": invocation.params,
+                "action_raw_body": invocation.raw_body,
                 "explicit_action_call": invocation.explicit,
             }
         )
+        if invocation.name == "stable":
+            history.write(
+                {
+                    "event": "stable_action_request",
+                    "request_id": request_id,
+                    "source": source,
+                    "channel_id": message.channel.id,
+                    "user_id": message.author.id,
+                    "has_raw_body": bool(invocation.raw_body.strip()),
+                    "state_path": str(stable_state_store.path_for(message.channel.id)),
+                }
+            )
 
         logger.info(
             "request_id=%s source=%s action=%s explicit=%s",
@@ -931,11 +1244,52 @@ def build_bot(settings: Settings) -> commands.Bot:
         )
 
         result = await action_registry.execute(message, invocation)
-        result_text = render_action_result(result)
+        result_text_raw = result.data.get("response_text")
+        if isinstance(result_text_raw, str) and result_text_raw.strip():
+            result_text = result_text_raw.strip()
+        else:
+            result_text = render_action_result(result)
+
+        artifact_path_raw = result.data.get("artifact_path")
+        artifact_path = None
+        if isinstance(artifact_path_raw, str) and artifact_path_raw.strip():
+            artifact_path = Path(artifact_path_raw)
+
         chunks = split_for_discord(result_text, settings.discord_chunk_size)
-        await message.reply(chunks[0], mention_author=False)
-        for extra_chunk in chunks[1:]:
-            await message.channel.send(extra_chunk)
+        upload_status = "none"
+        upload_error: str | None = None
+        try:
+            if artifact_path is not None:
+                upload_status = "uploaded"
+                await _send_discord_response(
+                    message,
+                    result_text,
+                    settings.discord_chunk_size,
+                    artifact_path=artifact_path,
+                )
+            else:
+                await _send_discord_response(
+                    message,
+                    result_text,
+                    settings.discord_chunk_size,
+                )
+        except Exception as exc:
+            if artifact_path is None:
+                raise
+            upload_status = "upload_error"
+            upload_error = str(exc)
+            logger.warning(
+                "request_id=%s action=%s failed to upload artifact=%s; falling back to text-only response: %s",
+                request_id,
+                result.action,
+                artifact_path,
+                exc,
+            )
+            await _send_discord_response(
+                message,
+                result_text,
+                settings.discord_chunk_size,
+            )
 
         history.write(
             {
@@ -948,8 +1302,70 @@ def build_bot(settings: Settings) -> commands.Bot:
                 "message": result.message,
                 "data": result.data,
                 "chunk_count": len(chunks),
+                "artifact_path": str(artifact_path) if artifact_path is not None else None,
+                "upload_status": upload_status,
+                "upload_error": upload_error,
             }
         )
+        if invocation.name == "stable":
+            if result.status == "stable_state_missing":
+                history.write(
+                    {
+                        "event": "stable_state_missing",
+                        "request_id": request_id,
+                        "source": source,
+                        "channel_id": message.channel.id,
+                        "state_path": str(stable_state_store.path_for(message.channel.id)),
+                    }
+                )
+            if result.data.get("state_saved"):
+                history.write(
+                    {
+                        "event": "stable_state_saved",
+                        "request_id": request_id,
+                        "source": source,
+                        "channel_id": message.channel.id,
+                        "state_path": result.data.get("state_path"),
+                        "state_source": result.data.get("state_source"),
+                        "last_image_path": result.data.get("artifact_path"),
+                    }
+                )
+            if result.ok:
+                history.write(
+                    {
+                        "event": "stable_action_success",
+                        "request_id": request_id,
+                        "source": source,
+                        "channel_id": message.channel.id,
+                        "artifact_path": result.data.get("artifact_path"),
+                        "state_source": result.data.get("state_source"),
+                        "base_source": result.data.get("base_source"),
+                        "elapsed_seconds": result.data.get("elapsed_seconds"),
+                    }
+                )
+            else:
+                history.write(
+                    {
+                        "event": "stable_action_error",
+                        "request_id": request_id,
+                        "source": source,
+                        "channel_id": message.channel.id,
+                        "status": result.status,
+                        "error": upload_error or result.data.get("error") or result.message,
+                    }
+                )
+            if upload_error is not None:
+                history.write(
+                    {
+                        "event": "stable_action_error",
+                        "request_id": request_id,
+                        "source": source,
+                        "channel_id": message.channel.id,
+                        "status": "upload_error",
+                        "error": upload_error,
+                        "artifact_path": str(artifact_path) if artifact_path is not None else None,
+                    }
+                )
         return True
 
     async def _set_reasoning(
@@ -1082,29 +1498,40 @@ def build_bot(settings: Settings) -> commands.Bot:
         if not content and not has_attachments:
             return
 
-        if content.startswith("!ping"):
-            await bot.process_commands(message)
-            return
-
-        if content.startswith("!codex"):
-            prompt = content[len("!codex") :].strip()
-            await _handle_codex_prompt(message, prompt, source="bang_command")
-            return
-
-        if content:
-            handled_by_action = await _maybe_handle_standard_action(
-                message,
-                content,
-                source="bang_action" if content.startswith("!") else "plain_action",
+        if not _begin_message_processing(message.id):
+            logger.warning(
+                "Ignored duplicate Discord message_id=%s on channel_id=%s",
+                message.id,
+                message.channel.id,
             )
-            if handled_by_action:
+            return
+
+        try:
+            if content.startswith("!ping"):
+                await bot.process_commands(message)
                 return
 
-        if content.startswith("!"):
-            await bot.process_commands(message)
-            return
+            if content.startswith("!codex"):
+                prompt = content[len("!codex") :].strip()
+                await _handle_codex_prompt(message, prompt, source="bang_command")
+                return
 
-        await _handle_codex_prompt(message, content, source="plain_message")
+            if content:
+                handled_by_action = await _maybe_handle_standard_action(
+                    message,
+                    content,
+                    source="bang_action" if content.startswith("!") else "plain_action",
+                )
+                if handled_by_action:
+                    return
+
+            if content.startswith("!"):
+                await bot.process_commands(message)
+                return
+
+            await _handle_codex_prompt(message, content, source="plain_message")
+        finally:
+            _finish_message_processing(message.id)
 
     @bot.command(name="ping")
     async def ping(ctx: commands.Context[commands.Bot]) -> None:
@@ -1217,6 +1644,8 @@ def build_bot(settings: Settings) -> commands.Bot:
 
         async def _restart() -> None:
             await asyncio.sleep(1.0)
+            if _PROCESS_LOCK is not None:
+                _PROCESS_LOCK.release()
             os.execv(sys.executable, [sys.executable, "-m", "src.bot"])
 
         asyncio.create_task(_restart())
@@ -1273,10 +1702,23 @@ def build_bot(settings: Settings) -> commands.Bot:
 
 
 def main() -> None:
+    global _PROCESS_LOCK
+
     settings = load_settings()
     _configure_logging(settings)
-    bot = build_bot(settings)
-    bot.run(settings.discord_token)
+    project_root = Path(__file__).resolve().parent.parent
+    bot_lock = SingleInstanceLock(project_root / "runtime" / "bot.lock")
+    if not bot_lock.acquire():
+        logger.warning("Another bot process is already running. Exiting duplicate process.")
+        return
+
+    _PROCESS_LOCK = bot_lock
+    try:
+        bot = build_bot(settings)
+        bot.run(settings.discord_token)
+    finally:
+        bot_lock.release()
+        _PROCESS_LOCK = None
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ import logging
 import os
 import re
 import shlex
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,9 +18,10 @@ from uuid import uuid4
 import discord
 
 from .config import Settings
+from .stable_state import StablePromptBundle, StableStateStore
 
 
-AGENT_SCRIPTS_ROOT = Path(r"C:\Users\lucas\Documents\Projects\agent_scripts")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAX_FIND_RESULTS_DEFAULT = 20
 MAX_FIND_RESULTS_LIMIT = 200
 SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
@@ -38,6 +41,7 @@ class ActionInvocation:
     name: str
     params: dict[str, str]
     raw: str
+    raw_body: str
     explicit: bool
 
 
@@ -51,9 +55,24 @@ class ActionResult:
 
 
 class ActionRegistry:
-    def __init__(self, settings: Settings, logger: logging.Logger | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        stable_state_store: StableStateStore,
+        logger: logging.Logger | None = None,
+    ) -> None:
         self._settings = settings
+        self._stable_state_store = stable_state_store
         self._logger = logger or logging.getLogger(__name__)
+        self._project_root = PROJECT_ROOT
+        self._agent_scripts_root = self._resolve_configured_path(
+            settings.agent_scripts_root,
+            default=self._project_root.parent.parent / "agent_scripts",
+        )
+        self._stable_auto_image_script_path = self._resolve_configured_path(
+            settings.stable_auto_image_script_path,
+            default=self._project_root.parent / "stable diffusion" / "generate_auto_image.py",
+        )
         self._definitions: dict[str, ActionDefinition] = {
             "find_file": ActionDefinition(
                 name="find_file",
@@ -72,18 +91,28 @@ class ActionRegistry:
             "create_script": ActionDefinition(
                 name="create_script",
                 description=(
-                    "Cria script em nova pasta dentro de "
-                    "C:/Users/lucas/Documents/Projects/agent_scripts."
+                    "Cria script em nova pasta dentro de AGENT_SCRIPTS_ROOT "
+                    "(ou no padrao local do workspace se a variavel estiver vazia)."
                 ),
                 required_params=("name",),
                 optional_params=("language", "content", "filename"),
                 example='create_script name="merge_excels" language="python"',
             ),
+            "stable": ActionDefinition(
+                name="stable",
+                description="Roda o Auto Image local com base no ultimo bundle salvo do canal.",
+                required_params=(),
+                optional_params=(),
+                example="!stable cinematic portrait of a tired runner in the rain",
+            ),
         }
-        self._handlers: dict[str, Callable[[discord.Message, dict[str, str]], Awaitable[ActionResult]]] = {
+        self._handlers: dict[
+            str, Callable[[discord.Message, ActionInvocation], Awaitable[ActionResult]]
+        ] = {
             "find_file": self._run_find_file,
             "upload_file": self._run_upload_file,
             "create_script": self._run_create_script,
+            "stable": self._run_stable,
         }
 
     @property
@@ -108,34 +137,49 @@ class ActionRegistry:
         if not raw:
             return None
 
-        try:
-            tokens = shlex.split(raw, posix=True)
-        except ValueError:
-            return None
-
-        if not tokens:
-            return None
-
-        first = tokens[0].strip().lower()
+        explicit_match = re.match(r"^(?P<head>!?acao|!?action)(?=\s|$)", raw, flags=re.IGNORECASE)
         explicit = False
         action_name = ""
+        raw_body = ""
         params_tokens: list[str] = []
 
-        if first in {"acao", "action", "!acao", "!action"}:
+        if explicit_match:
             explicit = True
-            if len(tokens) >= 2:
-                action_name = tokens[1].strip().lower()
-                params_tokens = tokens[2:]
+            remainder = raw[explicit_match.end() :].lstrip()
+            if remainder:
+                parts = remainder.split(None, 1)
+                action_name = parts[0].strip().lower()
+                raw_body = parts[1] if len(parts) > 1 else ""
         else:
-            action_name = first.lstrip("!")
-            params_tokens = tokens[1:]
+            parts = raw.split(None, 1)
+            head = parts[0].strip().lower()
+            action_name = head.lstrip("!")
+            raw_body = parts[1] if len(parts) > 1 else ""
+
+        if action_name != "stable":
+            try:
+                params_tokens = shlex.split(raw_body, posix=True)
+            except ValueError:
+                return None
 
         if action_name not in self._definitions:
             if not explicit:
                 return None
-            return ActionInvocation(name=action_name, params=self._parse_params(params_tokens), raw=raw, explicit=True)
+            return ActionInvocation(
+                name=action_name,
+                params=self._parse_params(params_tokens),
+                raw=raw,
+                raw_body=raw_body,
+                explicit=True,
+            )
 
-        return ActionInvocation(name=action_name, params=self._parse_params(params_tokens), raw=raw, explicit=explicit)
+        return ActionInvocation(
+            name=action_name,
+            params=self._parse_params(params_tokens),
+            raw=raw,
+            raw_body=raw_body,
+            explicit=explicit,
+        )
 
     async def execute(self, message: discord.Message, invocation: ActionInvocation) -> ActionResult:
         if not invocation.name:
@@ -158,7 +202,7 @@ class ActionRegistry:
             )
 
         try:
-            return await handler(message, dict(invocation.params))
+            return await handler(message, invocation)
         except Exception as exc:
             self._logger.exception("Standard action failed: %s", invocation.name)
             return ActionResult(
@@ -198,6 +242,16 @@ class ActionRegistry:
         if self._settings.codex_workdir:
             return (Path(self._settings.codex_workdir).resolve() / path).resolve()
         return path.resolve()
+
+    def _resolve_configured_path(self, raw_path: str | None, *, default: Path) -> Path:
+        raw = (raw_path or "").strip()
+        if not raw:
+            return default.resolve(strict=False)
+
+        path = Path(raw).expanduser()
+        if path.is_absolute():
+            return path.resolve(strict=False)
+        return (self._project_root / path).resolve(strict=False)
 
     def _safe_slug(self, value: str, fallback: str = "script") -> str:
         cleaned = SAFE_NAME_PATTERN.sub("_", value.strip().lower())
@@ -247,7 +301,8 @@ class ActionRegistry:
 
         return matches, truncated
 
-    async def _run_find_file(self, _message: discord.Message, params: dict[str, str]) -> ActionResult:
+    async def _run_find_file(self, _message: discord.Message, invocation: ActionInvocation) -> ActionResult:
+        params = invocation.params
         name = (
             params.get("name")
             or params.get("query")
@@ -307,7 +362,8 @@ class ActionRegistry:
             message=f"find_file retornou {len(matches)} resultado(s).",
         )
 
-    async def _run_upload_file(self, message: discord.Message, params: dict[str, str]) -> ActionResult:
+    async def _run_upload_file(self, message: discord.Message, invocation: ActionInvocation) -> ActionResult:
+        params = invocation.params
         raw_path = (params.get("path") or params.get("file") or params.get("_free") or "").strip()
         if not raw_path:
             return ActionResult(
@@ -389,7 +445,8 @@ class ActionRegistry:
             return "@echo off\r\necho TODO: implement\r\n"
         return f"# TODO: implement {default_name}\n"
 
-    async def _run_create_script(self, _message: discord.Message, params: dict[str, str]) -> ActionResult:
+    async def _run_create_script(self, _message: discord.Message, invocation: ActionInvocation) -> ActionResult:
+        params = invocation.params
         name = (
             params.get("name")
             or params.get("script_name")
@@ -433,7 +490,7 @@ class ActionRegistry:
         suffix = suffix_by_language[language]
 
         script_slug = self._safe_slug(name, fallback="script")
-        folder_base = AGENT_SCRIPTS_ROOT
+        folder_base = self._agent_scripts_root
         folder_base.mkdir(parents=True, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -469,6 +526,187 @@ class ActionRegistry:
                 "size_bytes": script_path.stat().st_size,
             },
             message=f"Script criado em {script_path}",
+        )
+
+    def _load_stable_base(self, channel_id: int) -> StablePromptBundle | None:
+        return self._stable_state_store.get(channel_id)
+
+    def _store_stable_bundle(self, channel_id: int, bundle: StablePromptBundle) -> StablePromptBundle:
+        return self._stable_state_store.set(channel_id, bundle)
+
+    def _run_stable_sync(
+        self,
+        *,
+        channel_id: int,
+        main_prompt: str,
+        base_bundle: StablePromptBundle,
+    ) -> ActionResult:
+        script_path = self._stable_auto_image_script_path
+        if not script_path.exists():
+            return ActionResult(
+                ok=False,
+                action="stable",
+                status="script_not_found",
+                data={"script_path": str(script_path)},
+                message=f"Script do Stable nao encontrado: {script_path}",
+            )
+
+        command = [
+            sys.executable,
+            str(script_path),
+            "--main-prompt",
+            main_prompt,
+            "--face-prompt",
+            base_bundle.face_prompt,
+            "--negative-prompt",
+            base_bundle.negative_prompt,
+            "--face-negative-prompt",
+            base_bundle.face_negative_prompt,
+            "--json",
+        ]
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(script_path.parent),
+        )
+        if process.returncode != 0:
+            return ActionResult(
+                ok=False,
+                action="stable",
+                status="stable_generation_failed",
+                data={
+                    "command": command,
+                    "return_code": process.returncode,
+                    "stdout": process.stdout.strip(),
+                    "stderr": process.stderr.strip(),
+                },
+                message="Falha ao rodar o workflow direto do Stable.",
+            )
+
+        try:
+            payload = json.loads(process.stdout)
+        except json.JSONDecodeError as exc:
+            return ActionResult(
+                ok=False,
+                action="stable",
+                status="invalid_generator_output",
+                data={
+                    "command": command,
+                    "stdout": process.stdout.strip(),
+                    "stderr": process.stderr.strip(),
+                    "error": str(exc),
+                },
+                message="O gerador retornou uma saida JSON invalida.",
+            )
+
+        if not isinstance(payload, dict):
+            return ActionResult(
+                ok=False,
+                action="stable",
+                status="invalid_generator_output",
+                data={
+                    "command": command,
+                    "stdout": process.stdout.strip(),
+                    "stderr": process.stderr.strip(),
+                },
+                message="O gerador retornou um payload inesperado.",
+            )
+
+        image_paths = payload.get("image_paths")
+        image_path = payload.get("primary_image_path")
+        if not isinstance(image_path, str) or not image_path.strip():
+            if isinstance(image_paths, list):
+                last_image = next(
+                    (str(value).strip() for value in reversed(image_paths) if isinstance(value, str) and str(value).strip()),
+                    "",
+                )
+                image_path = last_image
+        if not isinstance(image_path, str) or not image_path.strip():
+            return ActionResult(
+                ok=False,
+                action="stable",
+                status="stable_generation_failed",
+                data={
+                    "command": command,
+                    "stdout": process.stdout.strip(),
+                    "stderr": process.stderr.strip(),
+                    "payload": payload,
+                },
+                message="O workflow terminou sem informar uma imagem principal.",
+            )
+
+        normalized_image_path = str(Path(image_path).resolve(strict=False))
+        updated_bundle = self._store_stable_bundle(
+            channel_id,
+            base_bundle.with_updates(
+                main_prompt=main_prompt,
+                source="stable_action",
+                last_image_path=normalized_image_path,
+            ),
+        )
+        elapsed_seconds = payload.get("elapsed_seconds")
+        try:
+            elapsed_value = float(elapsed_seconds)
+        except (TypeError, ValueError):
+            elapsed_value = None
+
+        response_text = f"Imagem gerada automaticamente: {Path(normalized_image_path).name}"
+        if elapsed_value is not None:
+            response_text += f" em {elapsed_value:.2f}s"
+
+        return ActionResult(
+            ok=True,
+            action="stable",
+            status="generated",
+            data={
+                "command": command,
+                "artifact_path": normalized_image_path,
+                "response_text": response_text,
+                "elapsed_seconds": elapsed_value,
+                "prompt_id": payload.get("prompt_id"),
+                "payload": payload,
+                "state_path": str(self._stable_state_store.path_for(channel_id)),
+                "state_saved": True,
+                "state_source": updated_bundle.source,
+                "base_source": base_bundle.source,
+            },
+            message=f"Imagem gerada em {normalized_image_path}",
+        )
+
+    async def _run_stable(self, message: discord.Message, invocation: ActionInvocation) -> ActionResult:
+        if not invocation.raw_body.strip():
+            return ActionResult(
+                ok=False,
+                action="stable",
+                status="invalid_params",
+                data={},
+                message="Use `!stable <prompt principal>` com o texto completo da imagem.",
+            )
+
+        base_bundle = self._load_stable_base(message.channel.id)
+        if base_bundle is None:
+            return ActionResult(
+                ok=False,
+                action="stable",
+                status="stable_state_missing",
+                data={
+                    "channel_id": message.channel.id,
+                    "state_path": str(self._stable_state_store.path_for(message.channel.id)),
+                },
+                message=(
+                    "Nao encontrei uma base salva deste canal. Primeiro gere uma imagem normal aqui "
+                    "pelo fluxo do Codex para eu reaproveitar face/negative prompts."
+                ),
+            )
+
+        return await asyncio.to_thread(
+            self._run_stable_sync,
+            channel_id=message.channel.id,
+            main_prompt=invocation.raw_body,
+            base_bundle=base_bundle,
         )
 
 

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Code Change"
+  short_description: "Investigate, edit, and validate safely"
+  icon_small: "./assets/icon.png"
+  icon_large: "./assets/icon.png"
+  default_prompt: "Use $code-change to investigate the task, make the smallest correct code change, and validate it with evidence before closing out."

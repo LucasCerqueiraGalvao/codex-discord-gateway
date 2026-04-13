@@ -16,12 +16,12 @@ Bot Discord local que funciona como ponte para o Codex rodando no seu PC.
   - `!help`
   - `!baixo`, `!medio`, `!alto`, `!altissimo` (trocam o nivel de raciocinio)
   - `!status` (mostra configuracao atual + metricas locais e metricas oficiais do Codex/VSCode)
-  - `!timeout <segundos>` (altera timeout e salva no `.env`)
-  - `!reiniciar` (reinicia o processo do bot)
-  - `!reset` / `!newchat` (desvincula a sessao atual e inicia uma nova conversa no proximo prompt)
-  - `!acoes` / `!actions` (lista as acoes padronizadas)
-  - `!comandos` (lista de exemplos prontos)
-- Tenta executar acao padronizada primeiro (`find_file`, `upload_file`, `create_script`) e usa Codex quando nao houver acao registrada.
+- `!timeout <segundos>` (altera timeout e salva no `.env`)
+- `!reiniciar` (reinicia o processo do bot)
+- `!reset` / `!newchat` (desvincula a sessao atual e inicia uma nova conversa no proximo prompt)
+- `!acoes` / `!actions` (lista as acoes padronizadas)
+- `!comandos` (lista de exemplos prontos)
+- Tenta executar acao padronizada primeiro (`find_file`, `upload_file`, `create_script`, `stable`) e usa Codex quando nao houver acao registrada.
 - Processa anexos da mensagem (ex: `txt`, `py`, `pdf`, `csv`, imagens):
   - imagens sao enviadas via `--image` para o Codex
   - arquivos sao baixados localmente e repassados por caminho
@@ -39,11 +39,15 @@ Bot Discord local que funciona como ponte para o Codex rodando no seu PC.
   - o `cwd` das sessoes do Discord passa a ser a raiz `runtime/channel_workspaces/`
   - cada canal fica vinculado a um `session_id` persistente salvo localmente
   - o bot indexa a thread no catalogo do Codex e normaliza os metadados internos para ela aparecer no app desktop
+- Garante instancia unica para o bot/tray no Windows para evitar duplicidade acidental.
+- Mantem um estado estavel por canal para reaproveitar prompts do fluxo `!stable`.
 
 ## Estrutura
 
 ```text
 .
+|-- .agents/
+|   `-- skills/
 |-- assets/
 |   `-- codex-gateway-icon-final.png
 |-- src/
@@ -52,13 +56,18 @@ Bot Discord local que funciona como ponte para o Codex rodando no seu PC.
 |   |-- audio_transcriber.py
 |   |-- bot.py
 |   |-- channel_sessions.py
+|   |-- channel_workspace.py
 |   |-- codex_bridge.py
+|   |-- codex_official_status.py
 |   |-- codex_session_catalog.py
 |   |-- codex_thread_normalizer.py
 |   |-- config.py
 |   |-- history_log.py
+|   |-- single_instance.py
+|   |-- stable_state.py
 |   |-- text_utils.py
 |   `-- tray_app.py
+|-- tests/
 |-- scripts/
 |   |-- install-startup-task.ps1
 |   |-- remove-startup-task.ps1
@@ -75,7 +84,7 @@ Bot Discord local que funciona como ponte para o Codex rodando no seu PC.
 ## Setup
 
 ```powershell
-cd C:\Users\lucas\Documents\Projects\personal\codex-discord-gateway
+cd C:\caminho\para\codex-discord-gateway
 .\scripts\setup.ps1
 ```
 
@@ -89,6 +98,8 @@ Depois, edite `.env`.
 - `CODEX_CMD`
 - `CODEX_TIMEOUT_SECONDS`
 - `CODEX_WORKDIR`
+- `AGENT_SCRIPTS_ROOT` (opcional, destino do `create_script`)
+- `STABLE_AUTO_IMAGE_SCRIPT_PATH` (opcional, script usado pelo `!stable`)
 - `ATTACHMENTS_TEMP_DIR` (pasta temporaria dos anexos)
 - `ATTACHMENTS_MAX_MB` (limite por anexo)
 - `ATTACHMENTS_KEEP_FILES` (`true/false`, manter ou limpar anexos apos resposta)
@@ -115,6 +126,9 @@ Recomendacao de `CODEX_CMD`:
 codex exec --skip-git-repo-check --json --sandbox danger-full-access -c model_reasoning_effort="medium"
 ```
 
+Se `AGENT_SCRIPTS_ROOT` estiver vazio, o bot usa por padrao uma pasta `agent_scripts` na raiz de `Projects`.
+Se `STABLE_AUTO_IMAGE_SCRIPT_PATH` estiver vazio, o bot tenta usar o script irmao em `../stable diffusion/generate_auto_image.py`.
+
 ## Workspaces por canal
 
 - O bot sempre cria uma pasta por canal em `runtime/channel_workspaces/`.
@@ -122,6 +136,7 @@ codex exec --skip-git-repo-check --json --sandbox danger-full-access -c model_re
 - Dentro dela, o bot grava:
   - uma subpasta por canal com `README.md`
   - uma subpasta por canal com `conversation.md`
+- Como o app do Codex costuma agrupar o historico pelo `cwd`, essas threads do Discord podem aparecer vinculadas ao workspace compartilhado de runtime em vez de ao repo raiz.
 
 Isso ajuda a:
 
@@ -134,15 +149,21 @@ Isso ajuda a:
 - A primeira mensagem de um canal cria uma nova sessao do Codex.
 - As mensagens seguintes usam `codex exec resume <session_id>` para continuar a mesma thread.
 - O mapeamento `canal -> session_id` fica salvo em `runtime/channel_sessions.json`.
-- A cada resposta, o bot atualiza `C:\Users\lucas\.codex\session_index.jsonl` e normaliza a thread em `C:\Users\lucas\.codex\state_5.sqlite` e no rollout `.jsonl`.
+- A cada resposta, o bot atualiza `%USERPROFILE%\.codex\session_index.jsonl` e normaliza a thread em `%USERPROFILE%\.codex\state_5.sqlite` e no rollout `.jsonl`.
 - Essa normalizacao ajusta `source` para `vscode` e grava o `cwd` no formato canonico do Windows (`\\?\C:\...`) para a thread aparecer no app desktop.
 
 Observacao importante:
 
-- isso nao substitui as sessoes oficiais do Codex em `C:\Users\lucas\.codex`;
+- isso nao substitui as sessoes oficiais do Codex em `%USERPROFILE%\.codex`;
 - depende de formatos internos do Codex, entao essa parte de indexacao nao e uma integracao oficial documentada;
 - e tambem nao muda automaticamente o projeto real do seu codigo.
 - Se voce quiser forcar uma thread nova no canal, use `!reset` ou `!newchat`.
+
+## Skills locais no app do Codex
+
+- Skills expostas a partir de `.agents/skills` podem aparecer na UI do Codex com o nome do projeto como origem.
+- Esse rotulo de origem vem do caminho/repositorio onde a skill mora; ele nao e lido do texto da `SKILL.md`.
+- Se a UI mostrar algo como `codex discord gateway` perto de uma skill local, isso normalmente significa apenas que a skill foi descoberta dentro deste repositorio.
 
 ## Audio (voice message)
 
@@ -160,8 +181,8 @@ Observacao:
 
 Voce pode chamar acoes de 3 jeitos:
 
-- Mensagem normal: `find_file name="README.md" root="C:/Users/lucas/Documents/Projects"`
-- Com `!`: `!upload_file path="C:/Users/lucas/Desktop/relatorio.pdf"`
+- Mensagem normal: `find_file name="README.md" root="C:/caminho/para/projetos"`
+- Com `!`: `!upload_file path="C:/caminho/para/relatorio.pdf"`
 - Chamada explicita: `acao create_script name="merge_excels" language="python"`
 
 Acoes atuais:
@@ -175,7 +196,11 @@ Acoes atuais:
 - `create_script`:
   - obrigatorio: `name`
   - opcionais: `language` (`python`, `powershell`, `batch`), `content`, `filename`
-  - regra fixa: sempre cria uma **nova pasta** em `C:\Users\lucas\Documents\Projects\agent_scripts`
+  - regra fixa: sempre cria uma **nova pasta** em `AGENT_SCRIPTS_ROOT` (ou no padrao local do workspace)
+- `stable`:
+  - usa o ultimo bundle de prompts salvo para o canal
+  - reaproveita `face_prompt`, `negative_prompt` e `face_negative_prompt`
+  - exige `STABLE_AUTO_IMAGE_SCRIPT_PATH` valido (ou o fallback local padrao)
 
 ## Rodar em segundo plano (bandeja)
 

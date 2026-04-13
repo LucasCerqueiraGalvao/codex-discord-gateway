@@ -10,6 +10,8 @@ import pystray
 from PIL import Image, ImageDraw
 from pystray import MenuItem as item
 
+from .single_instance import SingleInstanceLock
+
 
 LOGGER = logging.getLogger("discord_codex_tray")
 ICON_FILE_RELATIVE_PATH = Path("assets") / "codex-gateway-icon-final.png"
@@ -123,60 +125,67 @@ def main() -> None:
     project_root = Path(__file__).resolve().parent.parent
     log_dir = project_root / "logs"
     _configure_logging(log_dir)
+    tray_lock = SingleInstanceLock(project_root / "runtime" / "tray.lock")
+    if not tray_lock.acquire():
+        LOGGER.warning("Another tray instance is already running. Exiting duplicate tray process.")
+        return
 
-    venv_python = project_root / ".venv" / "Scripts" / "python.exe"
-    python_exe = venv_python if venv_python.exists() else Path("python.exe")
-    supervisor = BotSupervisor(project_root=project_root, python_exe=python_exe)
-    supervisor.ensure_running()
+    try:
+        venv_python = project_root / ".venv" / "Scripts" / "python.exe"
+        python_exe = venv_python if venv_python.exists() else Path("python.exe")
+        supervisor = BotSupervisor(project_root=project_root, python_exe=python_exe)
+        supervisor.ensure_running()
 
-    stop_event = threading.Event()
+        stop_event = threading.Event()
 
-    def watchdog() -> None:
-        while not stop_event.is_set():
-            try:
-                supervisor.ensure_running()
-            except Exception:
-                LOGGER.exception("Unexpected error in watchdog loop")
-            stop_event.wait(5)
+        def watchdog() -> None:
+            while not stop_event.is_set():
+                try:
+                    supervisor.ensure_running()
+                except Exception:
+                    LOGGER.exception("Unexpected error in watchdog loop")
+                stop_event.wait(5)
 
-    watcher = threading.Thread(target=watchdog, daemon=True, name="bot-watchdog")
-    watcher.start()
+        watcher = threading.Thread(target=watchdog, daemon=True, name="bot-watchdog")
+        watcher.start()
 
-    def on_restart(icon: pystray.Icon, _menu_item: pystray.MenuItem) -> None:
-        supervisor.restart()
-        icon.notify("Bot reiniciado.")
+        def on_restart(icon: pystray.Icon, _menu_item: pystray.MenuItem) -> None:
+            supervisor.restart()
+            icon.notify("Bot reiniciado.")
 
-    def on_open_logs(_icon: pystray.Icon, _menu_item: pystray.MenuItem) -> None:
-        _open_path(log_dir)
+        def on_open_logs(_icon: pystray.Icon, _menu_item: pystray.MenuItem) -> None:
+            _open_path(log_dir)
 
-    def on_open_project(_icon: pystray.Icon, _menu_item: pystray.MenuItem) -> None:
-        _open_path(project_root)
+        def on_open_project(_icon: pystray.Icon, _menu_item: pystray.MenuItem) -> None:
+            _open_path(project_root)
 
-    def on_exit(icon: pystray.Icon, _menu_item: pystray.MenuItem) -> None:
-        stop_event.set()
-        supervisor.stop()
-        icon.stop()
+        def on_exit(icon: pystray.Icon, _menu_item: pystray.MenuItem) -> None:
+            stop_event.set()
+            supervisor.stop()
+            icon.stop()
 
-    icon = pystray.Icon(
-        "CodexDiscordGateway",
-        _load_icon_image(project_root),
-        "Codex Discord Gateway",
-        menu=pystray.Menu(
-            item(
-                lambda _item: f"Status: {supervisor.status()}",
-                lambda _icon, _menu_item: None,
-                enabled=False,
+        icon = pystray.Icon(
+            "CodexDiscordGateway",
+            _load_icon_image(project_root),
+            "Codex Discord Gateway",
+            menu=pystray.Menu(
+                item(
+                    lambda _item: f"Status: {supervisor.status()}",
+                    lambda _icon, _menu_item: None,
+                    enabled=False,
+                ),
+                item("Reiniciar bot", on_restart),
+                item("Abrir logs", on_open_logs),
+                item("Abrir pasta do projeto", on_open_project),
+                item("Sair", on_exit),
             ),
-            item("Reiniciar bot", on_restart),
-            item("Abrir logs", on_open_logs),
-            item("Abrir pasta do projeto", on_open_project),
-            item("Sair", on_exit),
-        ),
-    )
+        )
 
-    LOGGER.info("Tray app started")
-    icon.run()
-    LOGGER.info("Tray app stopped")
+        LOGGER.info("Tray app started")
+        icon.run()
+        LOGGER.info("Tray app stopped")
+    finally:
+        tray_lock.release()
 
 
 if __name__ == "__main__":
